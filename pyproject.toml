@@ -1,0 +1,52 @@
+[project]
+name = "walle-insights"
+version = "1.0.0"
+description = "LLM-powered incident classification and analysis system"
+readme = "docs/README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "openpyxl>=3.1.0",
+    "pydantic>=2.5.0",
+    "pydantic-ai>=0.0.13",
+    "pydantic-settings>=2.0.0",
+    "openai>=1.10.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.25.0",
+    "tqdm>=4.66.0",
+    "seaborn>=0.13.2",
+    "scipy>=1.16.3",
+    "scikit-learn>=1.7.2",
+    "reportlab>=4.4.6",
+    "msal>=1.20.0",
+    "psycopg2-binary>=2.9.0",
+    "boto3>=1.34.0",
+    "sqlalchemy>=2.0.0",
+    "snowflake-connector-python[pandas]>=3.6.0",
+    "cryptography>=42.0.0",
+    "ipywidgets>=8.1.8",
+    "plotly>=6.5.2",
+    "nbformat>=5.10.4",
+    "watchdog>=6.0.0",
+    "matplotlib-venn>=1.1.2",
+    "nltk==3.9.3"
+]
+
+[project.scripts]
+walle = "insights.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["insights"]
