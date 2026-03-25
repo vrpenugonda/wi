@@ -1,0 +1,519 @@
+name: WALLE - L123 Classification
+
+on:
+  workflow_call:
+    inputs:
+      run_timestamp:
+        required: true
+        type: string
+      l123_worker_count:
+        required: true
+        type: string
+      l123_matrix:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+    outputs:
+      l123_merged_file:
+        description: "Path to merged L123 results file"
+        value: ${{ jobs.l123-merge.outputs.l123_merged_file }}
+      subcategories:
+        description: "JSON array of subcategories"
+        value: ${{ jobs.l123-merge.outputs.subcategories }}
+      l4_matrix:
+        description: "Matrix for L4 parallel jobs"
+        value: ${{ jobs.l123-merge.outputs.l4_matrix }}
+    secrets:
+      AZURE_ENDPOINT:
+        required: true
+      AZURE_DEPLOYMENT:
+        required: true
+      API_VERSION:
+        required: true
+      CLIENT_ID:
+        required: true
+      CLIENT_SECRET:
+        required: true
+      TOKEN_URL:
+        required: true
+      SCOPE:
+        required: true
+      PROJECT_ID:
+        required: true
+      ENTERPRISE_USERNAME:
+        required: true
+      ENTERPRISE_TOKEN:
+        required: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  l123-classify:
+    name: L123 Worker ${{ matrix.worker }}
+    runs-on: uhg-runner
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.l123_matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        id: deps-1
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Install dependencies (retry 2)
+        if: steps.deps-1.outcome == 'failure'
+        id: deps-2
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 1 failed, retrying in 15s..."
+          sleep 15
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Install dependencies (retry 3)
+        if: steps.deps-1.outcome == 'failure' && steps.deps-2.outcome == 'failure'
+        shell: bash
+        timeout-minutes: 5
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 2 failed, retrying in 30s..."
+          sleep 30
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Download input data
+        uses: actions/download-artifact@v4
+        with:
+          name: input-data-${{ inputs.run_timestamp }}
+          path: data/input/
+
+      - name: Run L123 Classification (Partition ${{ matrix.worker }})
+        env:
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_DEPLOYMENT: ${{ secrets.AZURE_DEPLOYMENT }}
+          API_VERSION: ${{ secrets.API_VERSION }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          SCOPE: ${{ secrets.SCOPE }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          X_UPSTREAM_ENV: ${{ inputs.environment == 'prod' && 'prod' || 'nonprod' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          WORKER_ID=${{ matrix.worker }}
+          TOTAL_WORKERS=${{ inputs.l123_worker_count }}
+          
+          echo "Worker $WORKER_ID of $TOTAL_WORKERS"
+          
+          mkdir -p data/input data/output
+          
+          DATA_FILE=$(ls -t data/input/incidents_*.csv 2>/dev/null | head -1)
+          if [[ -z "$DATA_FILE" ]]; then
+            echo "ERROR: No input data file found in data/input/"
+            ls -la data/input/
+            exit 1
+          fi
+          
+          echo "Using data file: $DATA_FILE"
+          
+          ACTUAL_RECORD_COUNT=$(uv run python -c "import pandas as pd; print(len(pd.read_csv('$DATA_FILE')))")
+          echo "Actual records in file: $ACTUAL_RECORD_COUNT"
+          
+          RECORDS_PER_PARTITION=$(( (ACTUAL_RECORD_COUNT + TOTAL_WORKERS - 1) / TOTAL_WORKERS ))
+          START_ROW=$(( WORKER_ID * RECORDS_PER_PARTITION ))
+          END_ROW=$(( START_ROW + RECORDS_PER_PARTITION ))
+          
+          if [[ $END_ROW -gt $ACTUAL_RECORD_COUNT ]]; then
+            END_ROW=$ACTUAL_RECORD_COUNT
+          fi
+          
+          if [[ $START_ROW -ge $ACTUAL_RECORD_COUNT ]]; then
+            echo "Worker $WORKER_ID: No rows to process"
+            touch "data/output/l123_partition_${WORKER_ID}_${{ inputs.run_timestamp }}_empty.marker"
+            exit 0
+          fi
+          
+          echo "Processing rows $START_ROW to $END_ROW"
+          
+          PARTITION_FILE="$(pwd)/data/input/partition_${WORKER_ID}.csv"
+          
+          uv run python -c "
+          import pandas as pd
+          import sys
+          df = pd.read_csv('$DATA_FILE')
+          print(f'Total rows in file: {len(df)}')
+          partition = df.iloc[$START_ROW:$END_ROW].copy()
+          print(f'Partition $WORKER_ID: rows $START_ROW to $END_ROW = {len(partition)} records')
+          partition.to_csv('$PARTITION_FILE', index=False)
+          print(f'Saved to $PARTITION_FILE')
+          if len(partition) == 0:
+              print('ERROR: Partition file has no data!')
+              sys.exit(1)
+          "
+          
+          OUTPUT_FILE="$(pwd)/data/output/l123_partition_${WORKER_ID}_${{ inputs.run_timestamp }}.csv"
+          
+          echo "Running L123 classification on $PARTITION_FILE..."
+          uv run walle l123 \
+            --input "$PARTITION_FILE" \
+            --output "$OUTPUT_FILE" \
+            --batch-size 10 \
+            --workers 100
+          
+          echo "Partition $WORKER_ID complete: $OUTPUT_FILE"
+
+      - name: Upload L123 partition results
+        id: upload-l123-part-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l123-partition-${{ matrix.worker }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/*.csv
+            data/output/*.csv
+          retention-days: 1
+
+      - name: Retry upload L123 partition results (attempt 2)
+        if: steps.upload-l123-part-1.outcome == 'failure'
+        id: upload-l123-part-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l123-partition-${{ matrix.worker }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/*.csv
+            data/output/*.csv
+          retention-days: 1
+
+      - name: Retry upload L123 partition results (attempt 3)
+        if: steps.upload-l123-part-1.outcome == 'failure' && steps.upload-l123-part-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: l123-partition-${{ matrix.worker }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/*.csv
+            data/output/*.csv
+          retention-days: 1
+
+  l123-merge:
+    name: Merge L123 Results
+    runs-on: uhg-runner
+    needs: [l123-classify]
+    if: ${{ !cancelled() && needs.l123-classify.result == 'success' }}
+    timeout-minutes: 15
+    outputs:
+      l123_merged_file: ${{ steps.merge.outputs.l123_merged_file }}
+      subcategories: ${{ steps.merge.outputs.subcategories }}
+      l4_matrix: ${{ steps.merge.outputs.l4_matrix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        id: deps-1
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Install dependencies (retry 2)
+        if: steps.deps-1.outcome == 'failure'
+        id: deps-2
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 1 failed, retrying in 15s..."
+          sleep 15
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Install dependencies (retry 3)
+        if: steps.deps-1.outcome == 'failure' && steps.deps-2.outcome == 'failure'
+        shell: bash
+        timeout-minutes: 5
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 2 failed, retrying in 30s..."
+          sleep 30
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Download all L123 partitions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: l123-partition-*
+          path: data/output/
+          merge-multiple: true
+
+      - name: Download original input data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: input-data-*
+          path: data/input/
+          merge-multiple: true
+
+      - name: Merge L123 partitions
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          mkdir -p data/output
+          MERGED_FILE="data/output/classified_incidents_${{ inputs.run_timestamp }}.csv"
+          
+          uv run python << EOF
+          import pandas as pd
+          import glob
+          import json
+          import os
+          
+          print("=" * 60)
+          print("Merging L123 Classification Results")
+          print("=" * 60)
+          
+          # L123 checkpoint columns -> Final schema columns
+          L123_COLUMN_MAP = {
+              'category': 'ai_l1',
+              'subcategory': 'ai_l2',
+              'product': 'ai_l3',
+              'confidence_score': 'ai_confidence',
+              'self_resolved': 'ai_self_resolved',
+              'rationale': 'ai_rationale',
+              'keywords_identified': 'ai_keywords',
+              'root_cause_indicator': 'ai_root_cause_indicator',
+              'root_cause': 'ai_root_cause',
+          }
+          
+          print("\nSearching for CSV files...")
+          for root, dirs, files in os.walk("data"):
+              for f in files:
+                  if f.endswith(".csv"):
+                      print(f"  Found: {os.path.join(root, f)}")
+          
+          # Load original input data (has all incident fields)
+          # Try multiple patterns to handle different directory structures
+          input_files = []
+          for pattern in ["data/input/incidents_*.csv", "data/input/**/incidents_*.csv", "data/**/incidents_*.csv"]:
+              input_files.extend(glob.glob(pattern, recursive=True))
+          input_files = sorted(set([f for f in input_files if 'checkpoint' not in f.lower() and 'classified' not in f.lower()]))
+          print(f"\nInput files: {input_files}")
+          
+          original_df = None
+          if input_files:
+              original_dfs = []
+              for f in input_files:
+                  df = pd.read_csv(f)
+                  print(f"  Loaded original data: {f} ({len(df)} records)")
+                  original_dfs.append(df)
+              if original_dfs:
+                  original_df = pd.concat(original_dfs, ignore_index=True)
+                  if 'in_id' in original_df.columns:
+                      original_df = original_df.drop_duplicates(subset=['in_id'], keep='last')
+                  print(f"  Original data: {len(original_df)} unique records")
+          
+          # Load L123 checkpoint files
+          checkpoint_files = []
+          for pattern in ["data/**/*checkpoint*.csv", "data/**/*partition*.csv"]:
+              checkpoint_files.extend(glob.glob(pattern, recursive=True))
+          checkpoint_files = sorted(set([f for f in checkpoint_files if 'l4' not in f.lower()]))
+          print(f"\nL123 checkpoint files: {checkpoint_files}")
+          
+          if not checkpoint_files:
+              print("ERROR: No L123 checkpoint files found")
+              exit(1)
+          
+          # Concatenate all checkpoint files
+          checkpoint_dfs = []
+          for f in checkpoint_files:
+              df = pd.read_csv(f)
+              print(f"  {f}: {len(df)} records, columns: {list(df.columns)[:8]}...")
+              checkpoint_dfs.append(df)
+          
+          checkpoints_df = pd.concat(checkpoint_dfs, ignore_index=True)
+          if 'incident_id' in checkpoints_df.columns:
+              checkpoints_df = checkpoints_df.drop_duplicates(subset=['incident_id'], keep='last')
+          print(f"Combined checkpoints: {len(checkpoints_df)} unique records")
+          
+          # Rename checkpoint columns to final schema
+          rename_dict = {k: v for k, v in L123_COLUMN_MAP.items() if k in checkpoints_df.columns}
+          if rename_dict:
+              print(f"Renaming columns: {list(rename_dict.keys())} -> {list(rename_dict.values())}")
+              checkpoints_df = checkpoints_df.rename(columns=rename_dict)
+          
+          # Merge checkpoints into original data
+          if original_df is not None and 'in_id' in original_df.columns and 'incident_id' in checkpoints_df.columns:
+              print(f"\nMerging L123 results into original data...")
+              
+              # Get classification columns (exclude incident_id which is the join key)
+              class_cols = [c for c in checkpoints_df.columns if c != 'incident_id']
+              checkpoints_subset = checkpoints_df[['incident_id'] + class_cols].copy()
+              
+              # Merge on incident_id -> in_id
+              merged = original_df.merge(
+                  checkpoints_subset,
+                  left_on='in_id',
+                  right_on='incident_id',
+                  how='left'
+              )
+              
+              # Drop the duplicate incident_id column from merge
+              if 'incident_id' in merged.columns:
+                  merged = merged.drop(columns=['incident_id'])
+              
+              print(f"  Merged: {len(merged)} records")
+              
+              # Check how many got L123 results
+              if 'ai_l1' in merged.columns:
+                  classified = merged['ai_l1'].notna().sum()
+                  print(f"  L123 classified: {classified}/{len(merged)} ({100*classified/len(merged):.1f}%)")
+          else:
+              # No original data available, just use checkpoints with column renaming
+              print("\nNo original data available, using checkpoints directly")
+              merged = checkpoints_df
+              if 'incident_id' in merged.columns:
+                  merged = merged.rename(columns={'incident_id': 'in_id'})
+          
+          merged.to_csv("$MERGED_FILE", index=False)
+          print(f"\nMerged: {len(merged)} total records -> $MERGED_FILE")
+          print(f"Columns: {list(merged.columns)}")
+          
+          subcol = 'ai_l2' if 'ai_l2' in merged.columns else ('subcategory' if 'subcategory' in merged.columns else None)
+          if subcol and subcol in merged.columns:
+              subcats = merged[subcol].dropna().unique().tolist()
+              print(f"\nFound {len(subcats)} subcategories: {subcats}")
+          else:
+              subcats = []
+          
+          with open("subcategories.json", "w") as f:
+              json.dump(subcats, f)
+          with open("l4_matrix.json", "w") as f:
+              json.dump({"subcategory": subcats}, f)
+          print("=" * 60)
+          EOF
+          
+          SUBCATEGORIES=$(cat subcategories.json)
+          L4_MATRIX=$(cat l4_matrix.json)
+          
+          echo "l123_merged_file=${MERGED_FILE}" >> "$GITHUB_OUTPUT"
+          echo "subcategories=${SUBCATEGORIES}" >> "$GITHUB_OUTPUT"
+          # Use delimiter to safely output JSON with special characters
+          {
+            echo "l4_matrix<<MATRIX_EOF"
+            echo "${L4_MATRIX}"
+            echo "MATRIX_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload merged L123 results
+        id: upload-l123-merged-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l123-merged-${{ inputs.run_timestamp }}
+          path: data/output/classified_incidents_*.csv
+          retention-days: 7
+
+      - name: Retry upload merged L123 results (attempt 2)
+        if: steps.upload-l123-merged-1.outcome == 'failure'
+        id: upload-l123-merged-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l123-merged-${{ inputs.run_timestamp }}
+          path: data/output/classified_incidents_*.csv
+          retention-days: 7
+
+      - name: Retry upload merged L123 results (attempt 3)
+        if: steps.upload-l123-merged-1.outcome == 'failure' && steps.upload-l123-merged-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: l123-merged-${{ inputs.run_timestamp }}
+          path: data/output/classified_incidents_*.csv
+          retention-days: 7

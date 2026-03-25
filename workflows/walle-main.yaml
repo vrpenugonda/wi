@@ -1,0 +1,241 @@
+name: WALLE Pipeline - Main Orchestrator
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  
+  workflow_dispatch:
+    inputs:
+      minutes_back:
+        description: "Minutes of data to process (default: 120)"
+        required: false
+        type: number
+        default: 120
+      days_back:
+        description: "Days of data to process (overrides minutes_back)"
+        required: false
+        type: number
+        default: 0
+      start_date:
+        description: "Start date (YYYY-MM-DD) - overrides minutes/days_back"
+        required: false
+        type: string
+        default: ""
+      end_date:
+        description: "End date (YYYY-MM-DD) - defaults to now if start_date set"
+        required: false
+        type: string
+        default: ""
+      l123_file:
+        description: "Path to existing L123 file (skip L123 step if provided)"
+        required: false
+        type: string
+        default: ""
+      skip_l123:
+        description: "Skip L123 classification (use most recent output)"
+        required: false
+        type: boolean
+        default: false
+      skip_l4:
+        description: "Skip L4 classification"
+        required: false
+        type: boolean
+        default: false
+      l4_subcategories:
+        description: "Specific L4 subcategories to process (comma-separated, for reruns)"
+        required: false
+        type: string
+        default: ""
+      env:
+        description: "Target environment"
+        required: false
+        type: choice
+        options: [dev, stage, prod]
+        default: prod
+
+# Prevent overlapping runs - scheduled runs cancel previous scheduled runs,
+# but manual runs are allowed to complete
+concurrency:
+  group: walle-pipeline-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  prepare:
+    name: Prepare Data
+    uses: ./.github/workflows/walle-prepare.yaml
+    with:
+      minutes_back: ${{ github.event.inputs.minutes_back && fromJSON(github.event.inputs.minutes_back) || 120 }}
+      days_back: ${{ github.event.inputs.days_back && fromJSON(github.event.inputs.days_back) || 0 }}
+      start_date: ${{ github.event.inputs.start_date || '' }}
+      end_date: ${{ github.event.inputs.end_date || '' }}
+      l123_file: ${{ github.event.inputs.l123_file || '' }}
+      skip_l123: ${{ github.event.inputs.skip_l123 == 'true' }}
+      skip_l4: ${{ github.event.inputs.skip_l4 == 'true' }}
+      env: ${{ github.event.inputs.env || 'prod' }}
+    secrets: inherit
+
+  l123:
+    name: L123 Classification
+    needs: [prepare]
+    if: |
+      needs.prepare.outputs.record_count != '0' &&
+      ((github.event_name == 'schedule') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_l123 != 'true' && github.event.inputs.l123_file == ''))
+    uses: ./.github/workflows/walle-l123.yaml
+    with:
+      run_timestamp: ${{ needs.prepare.outputs.run_timestamp }}
+      l123_worker_count: ${{ needs.prepare.outputs.l123_worker_count || '1' }}
+      l123_matrix: ${{ needs.prepare.outputs.l123_matrix }}
+      environment: ${{ needs.prepare.outputs.environment }}
+    secrets: inherit
+
+  get-subcategories:
+    name: Get Subcategories for L4
+    needs: [prepare, l123]
+    if: |
+      always() &&
+      needs.prepare.outputs.record_count != '0' &&
+      (github.event_name == 'schedule' || github.event.inputs.skip_l4 != 'true') &&
+      (needs.l123.result == 'success' || needs.l123.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      l4_matrix: ${{ steps.matrix.outputs.l4_matrix }}
+      has_subcategories: ${{ steps.matrix.outputs.has_subcategories }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Download L123 results if available
+        if: needs.l123.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: l123-merged-${{ needs.prepare.outputs.run_timestamp }}
+          path: data/
+        continue-on-error: true
+      
+      - name: Generate L4 matrix
+        id: matrix
+        shell: bash
+        env:
+          L123_MATRIX: ${{ needs.l123.outputs.l4_matrix }}
+          L4_SUBCATEGORIES: ${{ github.event.inputs.l4_subcategories || '' }}
+        run: |
+          # Check if specific subcategories were provided for rerun
+          if [[ -n "${L4_SUBCATEGORIES}" ]]; then
+            echo "Using specified subcategories for rerun: ${L4_SUBCATEGORIES}"
+            python3 << 'PYEOF'
+          import json
+          import os
+          
+          subcats_input = os.environ.get('L4_SUBCATEGORIES', '')
+          subcats = [s.strip() for s in subcats_input.split(',') if s.strip()]
+          
+          matrix = {"subcategory": subcats}
+          matrix_json = json.dumps(matrix)
+          print(f"Rerun matrix: {matrix_json}")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("l4_matrix<<MATRIX_EOF\n")
+              f.write(f"{matrix_json}\n")
+              f.write("MATRIX_EOF\n")
+              f.write(f"has_subcategories={'true' if subcats else 'false'}\n")
+          PYEOF
+          elif [[ "${{ needs.l123.result }}" == "success" ]]; then
+            # Use env var to safely pass JSON without shell expansion issues
+            echo "l4_matrix=${L123_MATRIX}" >> "$GITHUB_OUTPUT"
+            
+            # Check if matrix has subcategories
+            if [[ "${L123_MATRIX}" == *'"subcategory":[]'* ]] || [[ -z "${L123_MATRIX}" ]]; then
+              echo "has_subcategories=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_subcategories=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            python3 << 'EOF'
+          import json
+          import csv
+          import os
+          
+          subcats = []
+          csv_file = None
+          
+          # Try to find the L123 file
+          for root, dirs, files in os.walk("data"):
+              for f in files:
+                  if f.endswith(".csv"):
+                      csv_file = os.path.join(root, f)
+                      break
+              if csv_file:
+                  break
+          
+          if csv_file and os.path.exists(csv_file):
+              with open(csv_file, 'r') as f:
+                  reader = csv.DictReader(f)
+                  subcol = None
+                  
+                  # Get first row to check columns
+                  first_row = next(reader, None)
+                  if first_row:
+                      if 'subcategory' in first_row:
+                          subcol = 'subcategory'
+                      elif 'ai_l2' in first_row:
+                          subcol = 'ai_l2'
+                      
+                      if subcol:
+                          subcats_set = set()
+                          if first_row.get(subcol):
+                              subcats_set.add(first_row[subcol])
+                          
+                          # Read remaining rows
+                          for row in reader:
+                              if row.get(subcol):
+                                  subcats_set.add(row[subcol])
+                          
+                          subcats = sorted(list(subcats_set))
+          
+          matrix = {"subcategory": subcats}
+          matrix_json = json.dumps(matrix)
+          print(f"Generated matrix: {matrix_json}")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              # Use heredoc delimiter for safe multi-value output
+              f.write("l4_matrix<<MATRIX_EOF\n")
+              f.write(f"{matrix_json}\n")
+              f.write("MATRIX_EOF\n")
+              f.write(f"has_subcategories={'true' if subcats else 'false'}\n")
+          EOF
+          fi
+
+  l4:
+    name: L4 Classification
+    needs: [prepare, get-subcategories]
+    if: |
+      always() &&
+      (github.event_name == 'schedule' || github.event.inputs.skip_l4 != 'true') &&
+      needs.get-subcategories.result == 'success' &&
+      needs.get-subcategories.outputs.has_subcategories == 'true'
+    uses: ./.github/workflows/walle-l4.yaml
+    with:
+      run_timestamp: ${{ needs.prepare.outputs.run_timestamp }}
+      l4_matrix: ${{ needs.get-subcategories.outputs.l4_matrix }}
+      environment: ${{ needs.prepare.outputs.environment }}
+    secrets: inherit
+
+  finalize:
+    name: Finalize Pipeline
+    needs: [prepare, l123, get-subcategories, l4]
+    if: |
+      always() &&
+      needs.prepare.outputs.record_count != '0' &&
+      (needs.l123.result == 'success' || needs.l123.result == 'skipped')
+    uses: ./.github/workflows/walle-finalize.yaml
+    with:
+      run_timestamp: ${{ needs.prepare.outputs.run_timestamp }}
+      environment: ${{ needs.prepare.outputs.environment }}
+      record_count: ${{ needs.prepare.outputs.record_count || '0' }}
+    secrets: inherit

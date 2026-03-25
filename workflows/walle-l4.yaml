@@ -1,0 +1,275 @@
+name: WALLE - L4 Classification
+
+on:
+  workflow_call:
+    inputs:
+      run_timestamp:
+        required: true
+        type: string
+      l4_matrix:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+    secrets:
+      AZURE_ENDPOINT:
+        required: true
+      AZURE_DEPLOYMENT:
+        required: true
+      API_VERSION:
+        required: true
+      CLIENT_ID:
+        required: true
+      CLIENT_SECRET:
+        required: true
+      TOKEN_URL:
+        required: true
+      SCOPE:
+        required: true
+      PROJECT_ID:
+        required: true
+      S3_ACCESS_KEY:
+        required: true
+      S3_SECRET_KEY:
+        required: true
+      S3_BUCKET_NAME:
+        required: true
+      S3_ENDPOINT_URL:
+        required: false
+      ENTERPRISE_USERNAME:
+        required: true
+      ENTERPRISE_TOKEN:
+        required: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  l4-classify:
+    name: L4 - ${{ matrix.subcategory }}
+    runs-on: uhg-runner
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJson(inputs.l4_matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        id: deps-1
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Install dependencies (retry 2)
+        if: steps.deps-1.outcome == 'failure'
+        id: deps-2
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 1 failed, retrying in 15s..."
+          sleep 15
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Install dependencies (retry 3)
+        if: steps.deps-1.outcome == 'failure' && steps.deps-2.outcome == 'failure'
+        shell: bash
+        timeout-minutes: 5
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 2 failed, retrying in 30s..."
+          sleep 30
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Download L123 results
+        uses: actions/download-artifact@v4
+        with:
+          name: l123-merged-${{ inputs.run_timestamp }}
+          path: data/output/
+        continue-on-error: true
+
+      - name: Run L4 Classification for ${{ matrix.subcategory }}
+        env:
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_DEPLOYMENT: ${{ secrets.AZURE_DEPLOYMENT }}
+          API_VERSION: ${{ secrets.API_VERSION }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          SCOPE: ${{ secrets.SCOPE }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          X_UPSTREAM_ENV: ${{ inputs.environment == 'prod' && 'prod' || 'nonprod' }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL || 'https://s3api-core.optum.com' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          SUBCATEGORY="${{ matrix.subcategory }}"
+          
+          mkdir -p data/output data/checkpoints data/taxonomies
+          
+          echo "Files in data/output:"
+          ls -la data/output/ || echo "No output dir"
+          
+          L123_FILE=""
+          FOUND=$(ls -t data/output/classified_incidents_*.csv 2>/dev/null | head -1)
+          if [[ -n "$FOUND" ]]; then
+            L123_FILE="$(pwd)/$FOUND"
+          fi
+          
+          if [[ -z "$L123_FILE" || ! -f "$L123_FILE" ]]; then
+            echo "ERROR: No L123 file found!"
+            exit 1
+          fi
+          
+          echo "Processing L4 for subcategory: $SUBCATEGORY"
+          echo "Using L123 file: $L123_FILE"
+          
+          MAX_RETRIES=3
+          RETRY_DELAY=30
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "--- Attempt $attempt of $MAX_RETRIES ---"
+            if uv run walle l4 \
+              --input "$L123_FILE" \
+              --subcategory "$SUBCATEGORY" \
+              --batch-size 5 \
+              --workers 50; then
+              echo "L4 classification succeeded on attempt $attempt"
+              break
+            fi
+            if [[ $attempt -eq $MAX_RETRIES ]]; then
+              echo "ERROR: L4 classification failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            echo "Attempt $attempt failed, retrying in ${RETRY_DELAY}s..."
+            sleep $RETRY_DELAY
+            RETRY_DELAY=$((RETRY_DELAY * 2))
+          done
+          
+          echo "L4 complete for: $SUBCATEGORY"
+
+      - name: Debug - List L4 files before upload
+        if: always()
+        shell: bash
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Listing data/checkpoints before upload:"
+          ls -la data/checkpoints || echo "No data/checkpoints dir"
+          echo "Listing data/taxonomies before upload:"
+          ls -la data/taxonomies || echo "No data/taxonomies dir"
+
+      - name: Upload L4 results
+        id: upload-l4-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l4-${{ matrix.subcategory }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/l4_*.csv
+            data/checkpoints/**/l4_*.csv
+            data/checkpoints/*_l4_checkpoint.csv
+            data/checkpoints/classified_incidents_*_l4_checkpoint.csv
+            data/checkpoints/**/*_l4_checkpoint.csv
+            data/taxonomies/l4_*.json
+            data/taxonomies/**/l4_*.json
+            data/taxonomies/l4_*_taxonomy.json*
+          retention-days: 7
+
+      - name: Retry upload L4 results (attempt 2)
+        if: steps.upload-l4-1.outcome == 'failure'
+        id: upload-l4-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l4-${{ matrix.subcategory }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/l4_*.csv
+            data/checkpoints/**/l4_*.csv
+            data/checkpoints/*_l4_checkpoint.csv
+            data/checkpoints/classified_incidents_*_l4_checkpoint.csv
+            data/checkpoints/**/*_l4_checkpoint.csv
+            data/taxonomies/l4_*.json
+            data/taxonomies/**/l4_*.json
+            data/taxonomies/l4_*_taxonomy.json*
+          retention-days: 7
+
+      - name: Retry upload L4 results (attempt 3)
+        if: steps.upload-l4-1.outcome == 'failure' && steps.upload-l4-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: l4-${{ matrix.subcategory }}-${{ inputs.run_timestamp }}
+          path: |
+            data/checkpoints/l4_*.csv
+            data/checkpoints/**/l4_*.csv
+            data/checkpoints/*_l4_checkpoint.csv
+            data/checkpoints/classified_incidents_*_l4_checkpoint.csv
+            data/checkpoints/**/*_l4_checkpoint.csv
+            data/taxonomies/l4_*.json
+            data/taxonomies/**/l4_*.json
+            data/taxonomies/l4_*_taxonomy.json*
+          retention-days: 7
+
+      - name: List L4 files for debugging
+        if: always()
+        shell: bash
+        run: |
+          echo "Listing data/checkpoints contents:"
+          ls -la data/checkpoints || echo "No data/checkpoints dir"
+          echo "\nListing data/taxonomies contents:"
+          ls -la data/taxonomies || echo "No data/taxonomies dir"
+          echo "\nMatching checkpoint globs:"
+          shopt -s nullglob globstar
+          for f in data/checkpoints/l4_*.csv data/checkpoints/**/l4_*.csv; do
+            echo "  $f"
+          done
+          echo "\nMatching taxonomy globs:"
+          for f in data/taxonomies/l4_*.json data/taxonomies/**/l4_*.json data/taxonomies/l4_*_taxonomy.json*; do
+            echo "  $f"
+          done

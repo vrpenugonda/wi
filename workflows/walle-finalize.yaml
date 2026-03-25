@@ -1,0 +1,253 @@
+name: WALLE - Finalize Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      run_timestamp:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      record_count:
+        required: true
+        type: string
+    secrets:
+      S3_ACCESS_KEY:
+        required: true
+      S3_SECRET_KEY:
+        required: true
+      S3_BUCKET_NAME:
+        required: true
+      S3_ENDPOINT_URL:
+        required: false
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_DATABASE:
+        required: true
+      SNOWFLAKE_SCHEMA:
+        required: true
+      SNOWFLAKE_USER:
+        required: true
+      SNOWFLAKE_WAREHOUSE:
+        required: true
+      SNOWFLAKE_CERTIFICATE:
+        required: true
+      ENTERPRISE_USERNAME:
+        required: true
+      ENTERPRISE_TOKEN:
+        required: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  finalize:
+    name: Finalize Pipeline
+    runs-on: uhg-runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        id: deps-1
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Install dependencies (retry 2)
+        if: steps.deps-1.outcome == 'failure'
+        id: deps-2
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 1 failed, retrying in 15s..."
+          sleep 15
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Install dependencies (retry 3)
+        if: steps.deps-1.outcome == 'failure' && steps.deps-2.outcome == 'failure'
+        shell: bash
+        timeout-minutes: 5
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 2 failed, retrying in 30s..."
+          sleep 30
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Merge results and upload
+        id: merge
+        shell: bash
+        env:
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL || 'https://s3api-core.optum.com' }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          FINAL_FILE="data/output/walle_classified_incidents_${{ inputs.run_timestamp }}.csv"
+          
+          uv run walle finalize \
+            --artifacts-dir artifacts/ \
+            --run-id "${{ inputs.run_timestamp }}" \
+            --output "${FINAL_FILE}" \
+            --env "${{ inputs.environment }}"
+          
+          echo "final_file=${FINAL_FILE}" >> "$GITHUB_OUTPUT"
+          RECORD_COUNT=$(python3 -c "import json; print(json.load(open('data/output/merge_stats.json'))['total_records'])")
+          echo "record_count=${RECORD_COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate summary
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "WALLE Pipeline Summary"
+          echo "=========================================="
+          echo "Run Timestamp: ${{ inputs.run_timestamp }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Input Records: ${{ inputs.record_count }}"
+          echo "Final Records: ${{ steps.merge.outputs.record_count }}"
+          echo ""
+          echo "Final Output: data/output/walle_classified_incidents_${{ inputs.run_timestamp }}.csv"
+          echo ""
+          echo "Uploads:"
+          echo "  S3 Blob Storage: done"
+          echo "  Snowflake: done"
+          echo "=========================================="
+
+      - name: Upload final results artifact
+        id: upload-final-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: walle-final-${{ inputs.run_timestamp }}
+          path: |
+            data/output/walle_classified_incidents_*.csv
+            data/output/merge_stats.json
+          retention-days: 7
+
+      - name: Retry upload final results (attempt 2)
+        if: steps.upload-final-1.outcome == 'failure'
+        id: upload-final-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: walle-final-${{ inputs.run_timestamp }}
+          path: |
+            data/output/walle_classified_incidents_*.csv
+            data/output/merge_stats.json
+          retention-days: 7
+
+      - name: Retry upload final results (attempt 3)
+        if: steps.upload-final-1.outcome == 'failure' && steps.upload-final-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: walle-final-${{ inputs.run_timestamp }}
+          path: |
+            data/output/walle_classified_incidents_*.csv
+            data/output/merge_stats.json
+          retention-days: 7
+
+  notify-failure:
+    name: Notify on Failure
+    runs-on: uhg-runner
+    needs: [finalize]
+    if: failure()
+    steps:
+      - name: Send failure notification email
+        shell: bash
+        run: |
+          python3 << 'EOF'
+          import smtplib
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          smtp_server = 'elr-smtp-relay-k8s.optum.com'
+          smtp_port = 25
+          from_addr = 'walle@optum.com'
+          to_addrs = [
+              'william_farland@optum.com',
+              'teja.marella@optum.com',
+              'walle_ops@optum.com'
+          ]
+
+          msg = MIMEMultipart()
+          msg['From'] = from_addr
+          msg['To'] = ', '.join(to_addrs)
+          msg['Subject'] = 'WALLE Pipeline Failed - ${{ github.workflow }}'
+
+          body = '''WALLE Classification Pipeline Failed
+          =====================================
+
+          Workflow: ${{ github.workflow }}
+          Run ID: ${{ github.run_id }}
+          Run Number: ${{ github.run_number }}
+          Triggered By: ${{ github.actor }}
+
+          View Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Please investigate the failure and take appropriate action.
+          '''
+          msg.attach(MIMEText(body, 'plain'))
+
+          try:
+              with smtplib.SMTP(smtp_server, smtp_port) as server:
+                  server.sendmail(from_addr, to_addrs, msg.as_string())
+              print(f'Email sent successfully to {to_addrs}')
+          except Exception as e:
+              print(f'Failed to send email: {e}')
+          EOF

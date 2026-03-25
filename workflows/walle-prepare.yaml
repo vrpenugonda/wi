@@ -1,0 +1,361 @@
+name: WALLE - Prepare Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_back:
+        type: number
+        default: 120
+      days_back:
+        type: number
+        default: 0
+      start_date:
+        type: string
+        default: ""
+      end_date:
+        type: string
+        default: ""
+      l123_file:
+        type: string
+        default: ""
+      skip_l123:
+        type: boolean
+        default: false
+      skip_l4:
+        type: boolean
+        default: false
+      env:
+        type: string
+        default: prod
+  workflow_call:
+    inputs:
+      minutes_back:
+        type: number
+        default: 120
+      days_back:
+        type: number
+        default: 0
+      start_date:
+        type: string
+        default: ""
+      end_date:
+        type: string
+        default: ""
+      l123_file:
+        type: string
+        default: ""
+      skip_l123:
+        type: boolean
+        default: false
+      skip_l4:
+        type: boolean
+        default: false
+      env:
+        type: string
+        default: prod
+    secrets:
+      DATAMARTDB:
+        required: true
+      DATAMARTHOST:
+        required: true
+      DATAMARTUSER:
+        required: true
+      DATAMARTPASS:
+        required: true
+      DATAMARTPORT:
+        required: false
+      S3_ACCESS_KEY:
+        required: true
+      S3_SECRET_KEY:
+        required: true
+      S3_BUCKET_NAME:
+        required: true
+      S3_ENDPOINT_URL:
+        required: false
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_DATABASE:
+        required: true
+      SNOWFLAKE_SCHEMA:
+        required: true
+      SNOWFLAKE_USER:
+        required: true
+      SNOWFLAKE_WAREHOUSE:
+        required: true
+      SNOWFLAKE_CERTIFICATE:
+        required: true
+      SNOWFLAKE_TABLE:
+        required: false
+      ENTERPRISE_USERNAME:
+        required: true
+      ENTERPRISE_TOKEN:
+        required: true
+    outputs:
+      run_timestamp:
+        value: ${{ jobs.prepare.outputs.run_timestamp }}
+      environment:
+        value: ${{ jobs.prepare.outputs.environment }}
+      record_count:
+        value: ${{ jobs.prepare.outputs.record_count }}
+      l123_worker_count:
+        value: ${{ jobs.prepare.outputs.l123_worker_count }}
+      l123_matrix:
+        value: ${{ jobs.prepare.outputs.l123_matrix }}
+      data_file:
+        value: ${{ jobs.prepare.outputs.data_file }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  RECORDS_PER_WORKER: 50000
+
+jobs:
+  prepare:
+    name: Prepare & Analyze Data
+    runs-on: uhg-runner
+    timeout-minutes: 30
+    outputs:
+      run_timestamp: ${{ steps.params.outputs.run_timestamp }}
+      environment: ${{ steps.params.outputs.environment }}
+      minutes_back: ${{ steps.params.outputs.minutes_back }}
+      days_back: ${{ steps.params.outputs.days_back }}
+      skip_l123: ${{ steps.params.outputs.skip_l123 }}
+      skip_l4: ${{ steps.params.outputs.skip_l4 }}
+      l123_file: ${{ steps.params.outputs.l123_file }}
+      record_count: ${{ steps.analyze.outputs.record_count }}
+      l123_worker_count: ${{ steps.analyze.outputs.l123_worker_count }}
+      l123_matrix: ${{ steps.analyze.outputs.l123_matrix }}
+      data_file: ${{ steps.analyze.outputs.data_file }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        id: deps-1
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Install dependencies (retry 2)
+        if: steps.deps-1.outcome == 'failure'
+        id: deps-2
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 1 failed, retrying in 15s..."
+          sleep 15
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Install dependencies (retry 3)
+        if: steps.deps-1.outcome == 'failure' && steps.deps-2.outcome == 'failure'
+        shell: bash
+        timeout-minutes: 5
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          echo "Attempt 2 failed, retrying in 30s..."
+          sleep 30
+          export PATH="$HOME/.local/bin:$PATH"
+          uv cache clean
+          uv sync --frozen
+
+      - name: Set run parameters
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          MINUTES_BACK="${{ inputs.minutes_back }}"
+          DAYS_BACK="${{ inputs.days_back }}"
+          START_DATE="${{ inputs.start_date }}"
+          END_DATE="${{ inputs.end_date }}"
+          SKIP_L4="${{ inputs.skip_l4 }}"
+          SKIP_L123="${{ inputs.skip_l123 }}"
+          L123_FILE="${{ inputs.l123_file }}"
+          ENVIRONMENT="${{ inputs.env }}"
+          
+          echo "minutes_back=${MINUTES_BACK}" >> "$GITHUB_OUTPUT"
+          echo "days_back=${DAYS_BACK}" >> "$GITHUB_OUTPUT"
+          echo "start_date=${START_DATE}" >> "$GITHUB_OUTPUT"
+          echo "end_date=${END_DATE}" >> "$GITHUB_OUTPUT"
+          echo "skip_l4=${SKIP_L4}" >> "$GITHUB_OUTPUT"
+          echo "skip_l123=${SKIP_L123}" >> "$GITHUB_OUTPUT"
+          echo "l123_file=${L123_FILE}" >> "$GITHUB_OUTPUT"
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "run_timestamp=$(date '+%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and analyze data
+        id: analyze
+        env:
+          DATAMARTDB: ${{ secrets.DATAMARTDB }}
+          DATAMARTHOST: ${{ secrets.DATAMARTHOST }}
+          DATAMARTUSER: ${{ secrets.DATAMARTUSER }}
+          DATAMARTPASS: ${{ secrets.DATAMARTPASS }}
+          DATAMARTPORT: ${{ secrets.DATAMARTPORT || '5432' }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL || 'https://s3api-core.optum.com' }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+          SNOWFLAKE_TABLE: ${{ secrets.SNOWFLAKE_TABLE || 'WALLE_CLASSIFIED_INCIDENTS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          SKIP_L123="${{ steps.params.outputs.skip_l123 }}"
+          L123_FILE="${{ steps.params.outputs.l123_file }}"
+          MINUTES_BACK="${{ steps.params.outputs.minutes_back }}"
+          DAYS_BACK="${{ steps.params.outputs.days_back }}"
+          START_DATE="${{ steps.params.outputs.start_date }}"
+          END_DATE="${{ steps.params.outputs.end_date }}"
+          
+          mkdir -p data/input data/output
+          
+          if [[ -n "$L123_FILE" && -f "$L123_FILE" ]]; then
+            echo "Using provided L123 file: $L123_FILE"
+            DATA_FILE="$L123_FILE"
+            RECORD_COUNT=$(python3 -c "import csv,sys; r=csv.reader(open('$L123_FILE')); next(r); print(sum(1 for _ in r))")
+          elif [[ "$SKIP_L123" == "true" ]]; then
+            DATA_FILE=$(ls -t data/output/classified_incidents_*.csv 2>/dev/null | head -1 || echo "")
+            if [[ -z "$DATA_FILE" ]]; then
+              echo "ERROR: No existing L123 file found"
+              exit 1
+            fi
+            RECORD_COUNT=$(python3 -c "import csv,sys; r=csv.reader(open('$DATA_FILE')); next(r); print(sum(1 for _ in r))")
+          else
+            DATA_FILE="data/input/incidents_${{ steps.params.outputs.run_timestamp }}.csv"
+            RAW_FILE="data/input/incidents_raw_${{ steps.params.outputs.run_timestamp }}.csv"
+            IDS_FILE="data/input/snowflake_ids_${{ steps.params.outputs.run_timestamp }}.txt"
+            
+            # Build time range arguments
+            TIME_ARGS=""
+            [[ -n "$START_DATE" ]] && TIME_ARGS="$TIME_ARGS --start-date $START_DATE"
+            [[ -n "$END_DATE" ]] && TIME_ARGS="$TIME_ARGS --end-date $END_DATE"
+            [[ "$DAYS_BACK" != "0" && -z "$START_DATE" ]] && TIME_ARGS="$TIME_ARGS --days-back $DAYS_BACK"
+            [[ "$DAYS_BACK" == "0" && -z "$START_DATE" ]] && TIME_ARGS="$TIME_ARGS --minutes-back $MINUTES_BACK"
+            
+            echo "=== Step 1: Fetch from DataMart ==="
+            echo "Running: uv run python -m insights fetch-datamart $TIME_ARGS --output $RAW_FILE"
+            timeout 300 uv run python -m insights fetch-datamart $TIME_ARGS --output "$RAW_FILE"
+            
+            # Calculate Snowflake dedup lookback to cover the fetch window + 6h buffer
+            DEDUP_HOURS=12
+            if [[ -n "$START_DATE" ]]; then
+              END_FOR_CALC="${END_DATE:-$(date '+%Y-%m-%d')}"
+              SPAN_SECONDS=$(( $(date -d "$END_FOR_CALC" +%s 2>/dev/null || date -j -f '%Y-%m-%d' "$END_FOR_CALC" +%s) - $(date -d "$START_DATE" +%s 2>/dev/null || date -j -f '%Y-%m-%d' "$START_DATE" +%s) ))
+              SPAN_HOURS=$(( SPAN_SECONDS / 3600 + 6 ))
+              [[ $SPAN_HOURS -gt $DEDUP_HOURS ]] && DEDUP_HOURS=$SPAN_HOURS
+            elif [[ "$DAYS_BACK" != "0" ]]; then
+              CALC_HOURS=$(( DAYS_BACK * 24 + 6 ))
+              [[ $CALC_HOURS -gt $DEDUP_HOURS ]] && DEDUP_HOURS=$CALC_HOURS
+            fi
+            echo "=== Step 2: Fetch existing IDs from Snowflake ==="
+            echo "Running: uv run python -m insights fetch-snowflake-ids --hours-back $DEDUP_HOURS --timeout 60 --output $IDS_FILE"
+            timeout 120 uv run python -m insights fetch-snowflake-ids --hours-back $DEDUP_HOURS --timeout 60 --output "$IDS_FILE" || true
+            
+            echo "=== Step 3: Deduplicate ==="
+            echo "Running: uv run python -m insights dedup --input $RAW_FILE --ids-file $IDS_FILE --output $DATA_FILE"
+            uv run python -m insights dedup --input "$RAW_FILE" --ids-file "$IDS_FILE" --output "$DATA_FILE"
+            
+            RECORD_COUNT=$(python3 -c "import csv,sys; r=csv.reader(open('$DATA_FILE')); next(r); print(sum(1 for _ in r))")
+          fi
+          
+          echo "Record count: $RECORD_COUNT"
+          echo "Data file: $DATA_FILE"
+          
+          # Check if we have any records to process
+          if [[ $RECORD_COUNT -eq 0 ]]; then
+            echo "::warning::No records found to process. Pipeline will complete with no output."
+            # Set empty matrix to skip L123 workers
+            L123_WORKER_COUNT=0
+            L123_MATRIX='{"worker": []}'
+          else
+            RECORDS_PER_WORKER=${{ env.RECORDS_PER_WORKER }}
+            L123_WORKER_COUNT=$(( (RECORD_COUNT + RECORDS_PER_WORKER - 1) / RECORDS_PER_WORKER ))
+            if [[ $L123_WORKER_COUNT -lt 1 ]]; then
+              L123_WORKER_COUNT=1
+            fi
+            if [[ $L123_WORKER_COUNT -gt 10 ]]; then
+              L123_WORKER_COUNT=10
+            fi
+            
+            L123_MATRIX=$(python3 -c "import json; print(json.dumps({'worker': list(range($L123_WORKER_COUNT))}))")
+          fi
+          
+          echo "L123 workers needed: $L123_WORKER_COUNT"
+          echo "L123 matrix: $L123_MATRIX"
+          
+          echo "record_count=${RECORD_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "l123_worker_count=${L123_WORKER_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "l123_matrix=${L123_MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "data_file=${DATA_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload input data
+        if: steps.analyze.outputs.record_count != '0'
+        id: upload-input-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: input-data-${{ steps.params.outputs.run_timestamp }}
+          path: data/input/
+          retention-days: 1
+
+      - name: Retry upload input data (attempt 2)
+        if: steps.analyze.outputs.record_count != '0' && steps.upload-input-1.outcome == 'failure'
+        id: upload-input-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: input-data-${{ steps.params.outputs.run_timestamp }}
+          path: data/input/
+          retention-days: 1
+
+      - name: Retry upload input data (attempt 3)
+        if: steps.analyze.outputs.record_count != '0' && steps.upload-input-1.outcome == 'failure' && steps.upload-input-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: input-data-${{ steps.params.outputs.run_timestamp }}
+          path: data/input/
+          retention-days: 1
