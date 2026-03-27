@@ -165,6 +165,136 @@ def get_table_columns(conn, table_name: str) -> list[str]:
         return []
 
 
+def ensure_l4_null_reasons_table_exists(conn, table_name: str = "WALLE_L4_NULL_REASONS") -> bool:
+    """
+    Ensure the L4 NULL reasons audit table exists in Snowflake.
+
+    Table design:
+    - One row per (in_id, walle_run_id) so the same incident can be audited across runs.
+    - recorded_at stored as TIMESTAMP_NTZ for easy time slicing.
+    """
+    create_sql = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        in_id VARCHAR(50),
+        walle_run_id VARCHAR(50),
+        reason VARCHAR(100),
+        cause VARCHAR(4000),
+        subcategory VARCHAR(255),
+        recorded_at TIMESTAMP_NTZ,
+        original_value VARCHAR(4000),
+        PRIMARY KEY (in_id, walle_run_id)
+    )
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(create_sql)
+        cursor.close()
+        logger.info(f"Table {table_name} is ready")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create L4 NULL reasons table {table_name}: {e}")
+        return False
+
+
+def upsert_l4_null_reasons_final(
+    conn,
+    rows: list[dict[str, Any]],
+    *,
+    table_name: str = "WALLE_L4_NULL_REASONS",
+) -> int:
+    """
+    Upsert final L4 NULL reasons into Snowflake.
+
+    Args:
+        conn: Snowflake connection
+        rows: List of dict rows with keys:
+            in_id, walle_run_id, reason, cause, subcategory, recorded_at, original_value
+        table_name: Target table name.
+
+    Returns:
+        Number of rows written to staging (best-effort indicator).
+    """
+    if not SNOWFLAKE_AVAILABLE:
+        raise ImportError("Snowflake connector not installed")
+    if not rows:
+        return 0
+
+    # Normalize into a DataFrame.
+    df = pd.DataFrame(rows)
+    # Required keys for merge.
+    if "in_id" not in df.columns or "walle_run_id" not in df.columns:
+        raise ValueError("rows must include in_id and walle_run_id")
+
+    # Uppercase for Snowflake.
+    df.columns = [c.upper() for c in df.columns]
+
+    # Ensure expected columns exist (MERGE will only use those present).
+    expected = ["IN_ID", "WALLE_RUN_ID", "REASON", "CAUSE", "SUBCATEGORY", "RECORDED_AT", "ORIGINAL_VALUE"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+    df = df[expected]
+
+    # Convert recorded_at to a Snowflake-friendly string format if present.
+    if "RECORDED_AT" in df.columns:
+        try:
+            df["RECORDED_AT"] = pd.to_datetime(df["RECORDED_AT"], errors="coerce").apply(
+                lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(x) else None
+            )
+        except Exception:
+            # Keep as-is; Snowflake TRY_TO_TIMESTAMP_NTZ in merge will handle best-effort.
+            pass
+
+    from snowflake.connector.pandas_tools import write_pandas
+
+    staging_table = f"{table_name}_STAGING_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    cursor = conn.cursor()
+    try:
+        success, _nchunks, nrows, _ = write_pandas(
+            conn=conn,
+            df=df,
+            table_name=staging_table,
+            auto_create_table=True,
+            overwrite=True,
+        )
+        if not success:
+            raise RuntimeError("write_pandas failed for L4 NULL reasons staging table")
+
+        # MERGE by (IN_ID, WALLE_RUN_ID). Update all other fields.
+        merge_sql = f"""
+        MERGE INTO {table_name} AS target
+        USING {staging_table} AS source
+          ON target.IN_ID = source.IN_ID
+         AND target.WALLE_RUN_ID = source.WALLE_RUN_ID
+        WHEN MATCHED THEN UPDATE SET
+          target.REASON = source.REASON,
+          target.CAUSE = source.CAUSE,
+          target.SUBCATEGORY = source.SUBCATEGORY,
+          target.RECORDED_AT = TRY_TO_TIMESTAMP_NTZ(source.RECORDED_AT::VARCHAR),
+          target.ORIGINAL_VALUE = source.ORIGINAL_VALUE
+        WHEN NOT MATCHED THEN INSERT (
+          IN_ID, WALLE_RUN_ID, REASON, CAUSE, SUBCATEGORY, RECORDED_AT, ORIGINAL_VALUE
+        ) VALUES (
+          source.IN_ID,
+          source.WALLE_RUN_ID,
+          source.REASON,
+          source.CAUSE,
+          source.SUBCATEGORY,
+          TRY_TO_TIMESTAMP_NTZ(source.RECORDED_AT::VARCHAR),
+          source.ORIGINAL_VALUE
+        )
+        """
+        cursor.execute(merge_sql)
+        cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        logger.info(f"Upserted {nrows} L4 NULL reason rows into {table_name}")
+        return int(nrows)
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
 def upload_to_snowflake(
     df: pd.DataFrame,
     run_id: str,
