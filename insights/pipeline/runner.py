@@ -260,6 +260,9 @@ class ClassificationPipeline:
             combined_l4_df = pd.concat(all_l4_dfs, ignore_index=True)
             logger.debug(f"Combined L4 df: {len(combined_l4_df)} records")
             
+            # Track per-incident invalid values we clean to NULL (final-reason logging)
+            invalid_cleaned_original: dict[str, str] = {}
+            
             # Clean up invalid L4 categories - but KEEP Unclassified_L4 (it's a valid classification)
             # Only remove truly invalid categories the model invents
             if 'l4_category' in combined_l4_df.columns:
@@ -269,6 +272,15 @@ class ClassificationPipeline:
                 invalid_mask = combined_l4_df['l4_category'].str.lower().str.match(invalid_pattern, na=False)
                 invalid_count = invalid_mask.sum()
                 if invalid_count > 0:
+                    # Capture original invalid values for final per-incident reason logging
+                    if "incident_id" in combined_l4_df.columns:
+                        try:
+                            tmp = combined_l4_df.loc[invalid_mask, ["incident_id", "l4_category"]].dropna()
+                            for _in_id, _val in tmp.itertuples(index=False, name=None):
+                                invalid_cleaned_original[str(_in_id)] = str(_val)
+                        except Exception:
+                            # Best-effort only; do not fail the pipeline on logging metadata capture
+                            pass
                     # Set invalid categories to None - they will show as blank
                     combined_l4_df.loc[invalid_mask, 'l4_category'] = None
                     logger.info(f"Removed {invalid_count} invalid L4 categories (not Unclassified_L4)")
@@ -343,8 +355,64 @@ class ClassificationPipeline:
         merged_df.to_csv(final_output, index=False)
         logger.info(f"Final output: {final_output} ({len(merged_df):,} records)")
         
-        # Upload artifacts to S3
+        # Use a single run_id for all downstream side effects (artifacts, Snowflake, NULL-reason audit)
         run_id = get_run_id()
+
+        # Final-state AI_L4 NULL logging (one row per incident whose AI_L4 is missing)
+        try:
+            from ..utils.l4_null_logging import L4NullRow, record_l4_nulls
+
+            def _is_missing_l4(v) -> bool:
+                if v is None:
+                    return True
+                s = str(v).strip()
+                return s == "" or s.lower() == "none"
+
+            if "in_id" in merged_df.columns:
+                l4_series = merged_df["ai_l4"] if "ai_l4" in merged_df.columns else None
+                if l4_series is not None:
+                    missing_mask = l4_series.apply(_is_missing_l4)
+                else:
+                    # If ai_l4 column is absent, treat all as missing for auditing
+                    missing_mask = merged_df["in_id"].apply(lambda _: True)
+
+                null_rows: list[L4NullRow] = []
+                for row in merged_df.loc[missing_mask].itertuples(index=False):
+                    # Access by attribute if possible; fall back to dict-like via _asdict().
+                    d = row._asdict() if hasattr(row, "_asdict") else {}
+                    in_id = str(d.get("in_id") or "")
+                    if not in_id:
+                        continue
+                    subcat = d.get("ai_l2")
+
+                    if in_id in invalid_cleaned_original:
+                        null_rows.append(
+                            L4NullRow(
+                                in_id=in_id,
+                                reason="l4_invalid_category_cleaned",
+                                cause="invalid_pattern_cleanup",
+                                subcategory=str(subcat) if subcat is not None else None,
+                                walle_run_id=run_id,
+                                original_value=invalid_cleaned_original.get(in_id),
+                            )
+                        )
+                    else:
+                        null_rows.append(
+                            L4NullRow(
+                                in_id=in_id,
+                                reason="l4_missing_after_l4_run",
+                                cause="ai_l4_missing_in_final_merge",
+                                subcategory=str(subcat) if subcat is not None else None,
+                                walle_run_id=run_id,
+                            )
+                        )
+
+                if null_rows:
+                    record_l4_nulls(null_rows, persist_to_snowflake=True, log_each_incident=False)
+        except Exception as e:
+            logger.warning("AI_L4 NULL final-reason logging failed (non-fatal): %s", e)
+
+        # Upload artifacts to S3
         logger.info(f"Uploading artifacts to S3 (run: {run_id})")
         
         # Find log file if it exists
