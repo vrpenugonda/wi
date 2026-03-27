@@ -95,6 +95,13 @@ def record_l4_nulls(
     for r in final_rows:
         summary[r.reason] = summary.get(r.reason, 0) + 1
 
+    # Always emit a stdout line so GitHub Actions captures it even if logging isn't configured.
+    print(
+        f"[L4-NULL] final reasons: total={total} persist={persist_to_snowflake} "
+        f"table={table_name} breakdown={dict(sorted(summary.items(), key=lambda kv: (-kv[1], kv[0])))}",
+        flush=True,
+    )
+
     logger.info(
         "AI_L4 NULL reasons (final): total=%d table=%s persist=%s breakdown=%s",
         total,
@@ -142,6 +149,7 @@ def record_l4_nulls(
         except Exception as e:
             # Don't fail the pipeline on logging persistence; caller can choose to enforce.
             persist_error = str(e)
+            print(f"[L4-NULL] Snowflake persistence FAILED: {persist_error}", flush=True)
             logger.warning("Failed to persist AI_L4 NULL reasons to Snowflake: %s", e)
 
     return {
