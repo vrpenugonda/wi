@@ -244,6 +244,9 @@ class ClassificationPipeline:
         
         # Load and merge L4 results - first combine all L4 checkpoints into one DataFrame
         all_l4_dfs = []
+        # Track per-incident invalid values we clean to NULL (final-reason logging).
+        # Must be defined even if no L4 checkpoints exist.
+        invalid_cleaned_original: dict[str, str] = {}
         logger.info(f"Merging L4 results from {len(l4_outputs)} subcategories: {list(l4_outputs.keys())}")
         for subcat, checkpoint in l4_outputs.items():
             checkpoint_path = Path(checkpoint)
@@ -259,9 +262,6 @@ class ClassificationPipeline:
             # Concatenate all L4 results
             combined_l4_df = pd.concat(all_l4_dfs, ignore_index=True)
             logger.debug(f"Combined L4 df: {len(combined_l4_df)} records")
-            
-            # Track per-incident invalid values we clean to NULL (final-reason logging)
-            invalid_cleaned_original: dict[str, str] = {}
             
             # Clean up invalid L4 categories - but KEEP Unclassified_L4 (it's a valid classification)
             # Only remove truly invalid categories the model invents
