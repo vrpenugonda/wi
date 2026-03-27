@@ -374,10 +374,14 @@ async def cmd_run(args):
     """Execute full pipeline."""
     import tempfile
     from pathlib import Path
+    import logging
     from .pipeline import run_full_pipeline
     from .utils import load_incidents_from_database
     from .config import get_settings
     
+    # Ensure logs show up in GitHub Actions / terminals.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     settings = get_settings()
     
     # Handle --l4-only mode: find incidents missing L4 in Snowflake
