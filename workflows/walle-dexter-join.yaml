@@ -219,6 +219,8 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           TOKEN_URL: ${{ secrets.TOKEN_URL }}
           SCOPE: ${{ secrets.SCOPE }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          X_UPSTREAM_ENV: ${{ inputs.env == 'prod' && 'prod' || 'nonprod' }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
