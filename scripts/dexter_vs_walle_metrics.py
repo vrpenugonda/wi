@@ -311,6 +311,12 @@ def _judge_with_pydantic_ai(
     if not deployment:
         raise RuntimeError("Missing AZURE_OPENAI_DEPLOYMENT_NAME for pydantic-ai judge")
 
+    # Mirror BaseClassifier.get_model() behavior: ensure OPENAI_API_VERSION is set.
+    if not (os.getenv("OPENAI_API_VERSION") or "").strip():
+        v = (os.getenv("AZURE_OPENAI_API_VERSION") or "").strip()
+        if v:
+            os.environ["OPENAI_API_VERSION"] = v
+
     model = OpenAIChatModel(deployment, provider="azure")
     x_upstream_env = (os.getenv("X_UPSTREAM_ENV") or os.getenv("X-Upstream-Env") or "").strip()
     project_id = (os.getenv("PROJECT_ID") or os.getenv("projectId") or "").strip()
