@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 from typing import Iterable
 
 import pandas as pd
@@ -63,6 +64,17 @@ def main() -> int:
     parser.add_argument("--chunk-rows", type=int, default=200_000, help="Rows per pandas chunk (default: 200000)")
     parser.add_argument("--sf-batch", type=int, default=1000, help="IDs per Snowflake IN(...) batch (default: 1000)")
     parser.add_argument(
+        "--sf-progress-every",
+        type=int,
+        default=25,
+        help="Print Snowflake batch progress every N batches (default: 25)",
+    )
+    parser.add_argument(
+        "--no-describe",
+        action="store_true",
+        help="Skip DESCRIBE TABLE and select '*' instead (faster start, but relies on stable schema).",
+    )
+    parser.add_argument(
         "--dedupe",
         action="store_true",
         default=True,
@@ -94,13 +106,18 @@ def main() -> int:
     conn = get_snowflake_connection()
     cur = conn.cursor()
     try:
-        # Discover all columns once so we can SELECT explicitly.
-        cur.execute(f"DESCRIBE TABLE {table_name}")
-        table_cols = [row[0] for row in cur.fetchall()]
-        if not table_cols:
-            raise RuntimeError(f"No columns discovered for Snowflake table: {table_name}")
-
-        select_cols_sql = ", ".join([f'"{c}"' for c in table_cols])
+        if args.no_describe:
+            table_cols = []
+            select_cols_sql = "*"
+            print(f"[WALLE] Using SELECT * (no DESCRIBE TABLE). Table: {table_name}", flush=True)
+        else:
+            print(f"[WALLE] DESCRIBE TABLE {table_name} ...", flush=True)
+            cur.execute(f"DESCRIBE TABLE {table_name}")
+            table_cols = [row[0] for row in cur.fetchall()]
+            if not table_cols:
+                raise RuntimeError(f"No columns discovered for Snowflake table: {table_name}")
+            select_cols_sql = ", ".join([f'"{c}"' for c in table_cols])
+            print(f"[WALLE] Discovered {len(table_cols)} columns", flush=True)
 
         first_write = True
         total_out = 0
@@ -110,6 +127,8 @@ def main() -> int:
 
         for dex_chunk in pd.read_csv(dex_path, chunksize=chunk_rows):
             total_chunks += 1
+            t0 = time.time()
+            print(f"\n[DEX] chunk {total_chunks}: read {len(dex_chunk):,} rows", flush=True)
             total_dex_rows_seen += len(dex_chunk)
 
             missing = [c for c in DEX_REQUIRED_COLS if c not in dex_chunk.columns]
@@ -142,26 +161,44 @@ def main() -> int:
 
             ids = dex_chunk["DEX_INGEST_TICKET_ID"].tolist()
             total_dex_ids_used += len(ids)
+            print(f"[DEX] chunk {total_chunks}: querying Snowflake for {len(ids):,} IDs", flush=True)
 
             # Fetch Snowflake rows for these ids
             walle_rows = []
-            for batch in _batched(ids, sf_batch):
+            batches = list(_batched(ids, sf_batch))
+            for b_idx, batch in enumerate(batches, start=1):
                 in_list = ", ".join([f"'{x}'" for x in batch])
                 sql = f"""
                 SELECT {select_cols_sql}
                 FROM {table_name}
                 WHERE IN_ID IN ({in_list})
                 """
+                t_sf0 = time.time()
                 cur.execute(sql)
-                walle_rows.extend(cur.fetchall())
+                rows = cur.fetchall()
+                walle_rows.extend(rows)
+                if args.sf_progress_every > 0 and (b_idx % args.sf_progress_every == 0 or b_idx == len(batches)):
+                    dt = time.time() - t_sf0
+                    print(
+                        f"[WALLE] chunk {total_chunks}: batch {b_idx}/{len(batches)} "
+                        f"fetched {len(rows):,} rows (total so far {len(walle_rows):,}) "
+                        f"in {dt:.1f}s",
+                        flush=True,
+                    )
 
             if not walle_rows:
                 print(f"[WALLE] chunk {total_chunks}: 0 Snowflake matches")
                 continue
 
+            if args.no_describe:
+                # With SELECT *, pandas can't infer column names from fetchall; require DESCRIBE for proper columns.
+                raise RuntimeError("Cannot build DataFrame columns with --no-describe; keep DESCRIBE enabled.")
+
             walle_df = pd.DataFrame(walle_rows, columns=table_cols)
             if "IN_ID" not in walle_df.columns:
-                raise RuntimeError(f"Expected IN_ID column in Snowflake table {table_name}, got: {list(walle_df.columns)}")
+                raise RuntimeError(
+                    f"Expected IN_ID column in Snowflake table {table_name}, got: {list(walle_df.columns)}"
+                )
 
             walle_df["IN_ID"] = walle_df["IN_ID"].astype(str).str.strip()
             walle_df = walle_df.drop_duplicates(subset=["IN_ID"], keep="last")
@@ -186,6 +223,7 @@ def main() -> int:
                 f"[JOIN] chunk {total_chunks}: wrote {len(merged):,} rows "
                 f"(total written: {total_out:,})"
             )
+            print(f"[TIME] chunk {total_chunks}: {time.time() - t0:.1f}s", flush=True)
 
         print(
             f"Done.\n"
