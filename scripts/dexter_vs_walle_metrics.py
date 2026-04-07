@@ -127,6 +127,17 @@ def _azure_openai_chat_json(
     endpoint = endpoint.rstrip("/")
     qs = urlencode({"api-version": api_version})
     url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?{qs}"
+    # Auth header selection:
+    # - In this repo's workflows/classifiers we often use an Azure AD access token (JWT) from client-credentials.
+    #   Azure OpenAI expects that as: Authorization: Bearer <token>
+    # - If a real Azure OpenAI API key is provided instead, use: api-key: <key>
+    token = (api_key or "").strip()
+    is_jwt = token.startswith("eyJ") and token.count(".") >= 2
+    headers = {"Content-Type": "application/json"}
+    if is_jwt:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["api-key"] = token
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -138,10 +149,7 @@ def _azure_openai_chat_json(
     req = request.Request(
         url,
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "api-key": api_key,
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -752,9 +760,21 @@ def main() -> int:
         api_version = os.getenv("AZURE_OPENAI_API_VERSION", os.getenv("OPENAI_API_VERSION", "")).strip() or "2024-02-15-preview"
 
         if not (endpoint and api_key and deployment):
-            llm_lines.append(
-                "- LLM judge skipped: missing one of AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT_NAME."
+            reason = "missing one of AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT_NAME"
+            llm_lines.append(f"- LLM judge skipped: {reason}.")
+            # Make the sheets non-empty so it's obvious in the workbook itself.
+            metric_6_rows = pd.DataFrame(
+                [
+                    {
+                        "status": "skipped",
+                        "reason": reason,
+                        "AZURE_OPENAI_ENDPOINT_set": bool(endpoint),
+                        "AZURE_OPENAI_API_KEY_set": bool(api_key),
+                        "AZURE_OPENAI_DEPLOYMENT_NAME_set": bool(deployment),
+                    }
+                ]
             )
+            metric_6_summary = pd.DataFrame([{"status": "skipped", "reason": reason}])
         else:
             rng = random.Random(int(args.llm_judge_seed))
             n_default = 200
@@ -956,6 +976,10 @@ Return ONLY valid JSON with this schema:
                     }
                 )
             metric_6_summary = pd.DataFrame(summary_rows)
+    else:
+        # If the flag wasn't enabled, still leave a visible marker row in the sheets.
+        metric_6_rows = pd.DataFrame([{"status": "disabled", "reason": "Run with --llm-judge (workflow input llm_judge=true)"}])
+        metric_6_summary = pd.DataFrame([{"status": "disabled", "reason": "Run with --llm-judge (workflow input llm_judge=true)"}])
 
     # ---- Per-sheet explainability blocks (inserted into each tab) ----
     usable_def = (
