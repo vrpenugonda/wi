@@ -244,11 +244,8 @@ jobs:
           # If LLM judge enabled, fetch an Azure AD token and pass Azure OpenAI env vars expected by Metric 6.
           if [[ "${{ inputs.llm_judge }}" == "true" ]]; then
             echo "LLM judge enabled. Fetching Azure AD token for Azure OpenAI..."
-            TOKEN="$(uv run python - << 'PY'
-            from insights.utils.auth import get_azure_ad_token
-            print(get_azure_ad_token())
-            PY
-            )"
+            # NOTE: Avoid heredocs inside YAML-indented bash blocks (bash requires the terminator at column 0).
+            TOKEN="$(uv run python -c "from insights.utils.auth import get_azure_ad_token; print(get_azure_ad_token())")"
             export AZURE_OPENAI_API_KEY="$TOKEN"
             export AZURE_OPENAI_ENDPOINT="${AZURE_ENDPOINT}"
             export AZURE_OPENAI_DEPLOYMENT_NAME="${AZURE_DEPLOYMENT}"
