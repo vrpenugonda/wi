@@ -113,7 +113,7 @@ def _azure_openai_chat_json(
     deployment: str,
     api_version: str,
     messages: list[dict],
-    max_tokens: int = 600,
+    max_completion_tokens: int = 600,
     temperature: float = 0.0,
     use_response_format_json: bool = True,
 ) -> dict:
@@ -155,7 +155,8 @@ def _azure_openai_chat_json(
     payload = {
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        # Newer models (and some Azure deployments) require max_completion_tokens instead of max_tokens.
+        "max_completion_tokens": max_completion_tokens,
     }
     # Some Azure OpenAI deployments/api-versions don't support response_format.
     # We'll optionally include it, and fall back (retry) at call-site if needed.
@@ -262,6 +263,11 @@ def _parse_azure_http_error(e: Exception) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def _looks_like_max_tokens_unsupported(e: Exception) -> bool:
+    s = str(e).lower()
+    return "unsupported parameter" in s and "max_tokens" in s and "max_completion_tokens" in s
 
 
 def _judge_with_pydantic_ai(
@@ -978,21 +984,37 @@ Return ONLY valid JSON with this schema:
                 while True:
                     try:
                         # Prefer the same stack as L4 classification (pydantic-ai Agent).
+                        # If the deployed model rejects max_tokens (some newer models), pydantic-ai may error;
+                        # in that case fall back to the REST call which uses max_completion_tokens.
                         try:
                             obj = _judge_with_pydantic_ai(system_prompt=system, user_prompt=user)
-                        except Exception:
-                            # Fallback to raw REST call (useful if pydantic-ai isn't available).
-                            resp = _azure_openai_chat_json(
-                                endpoint=endpoint,
-                                api_key=api_key,
-                                deployment=deployment,
-                                api_version=api_version,
-                                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                temperature=0.0,
-                                max_tokens=500,
-                                use_response_format_json=True,
-                            )
-                            obj = _extract_json_content(resp)
+                        except Exception as pe:
+                            if _looks_like_max_tokens_unsupported(pe):
+                                # Force REST path (uses max_completion_tokens).
+                                resp = _azure_openai_chat_json(
+                                    endpoint=endpoint,
+                                    api_key=api_key,
+                                    deployment=deployment,
+                                    api_version=api_version,
+                                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                    temperature=0.0,
+                                    max_completion_tokens=500,
+                                    use_response_format_json=True,
+                                )
+                                obj = _extract_json_content(resp)
+                            else:
+                                # Generic fallback to REST call (useful if pydantic-ai isn't available).
+                                resp = _azure_openai_chat_json(
+                                    endpoint=endpoint,
+                                    api_key=api_key,
+                                    deployment=deployment,
+                                    api_version=api_version,
+                                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                    temperature=0.0,
+                                    max_completion_tokens=500,
+                                    use_response_format_json=True,
+                                )
+                                obj = _extract_json_content(resp)
                         rec = {
                             "INC_ID": inc_id,
                             "a_system": a_name,
@@ -1029,7 +1051,7 @@ Return ONLY valid JSON with this schema:
                                         api_version=api_version,
                                         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                                         temperature=0.0,
-                                        max_tokens=500,
+                                        max_completion_tokens=500,
                                         use_response_format_json=False,
                                     )
                                     obj = _extract_json_content(resp)
