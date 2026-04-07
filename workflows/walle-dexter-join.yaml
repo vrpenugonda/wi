@@ -252,6 +252,8 @@ jobs:
             export AZURE_OPENAI_ENDPOINT="${AZURE_ENDPOINT}"
             export AZURE_OPENAI_DEPLOYMENT_NAME="${AZURE_DEPLOYMENT}"
             export AZURE_OPENAI_API_VERSION="${API_VERSION}"
+            # pydantic-ai/OpenAI clients also look for OPENAI_API_VERSION
+            export OPENAI_API_VERSION="${API_VERSION}"
           fi
 
           ARGS=(--in "$SAMPLE_PATH" --out "data/output/${{ inputs.report_name }}")
