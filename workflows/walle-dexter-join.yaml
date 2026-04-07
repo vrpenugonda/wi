@@ -96,7 +96,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
 
-          python - << 'PY'
+          uv run python - << 'PY'
           import os
           from pathlib import Path
           import boto3
