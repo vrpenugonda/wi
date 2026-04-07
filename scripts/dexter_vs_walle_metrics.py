@@ -114,6 +114,7 @@ def _azure_openai_chat_json(
     messages: list[dict],
     max_tokens: int = 600,
     temperature: float = 0.0,
+    use_response_format_json: bool = True,
 ) -> dict:
     """
     Minimal Azure OpenAI Chat Completions call (JSON response).
@@ -142,9 +143,11 @@ def _azure_openai_chat_json(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        # best-effort; if unsupported by deployment, the call may still succeed
-        "response_format": {"type": "json_object"},
     }
+    # Some Azure OpenAI deployments/api-versions don't support response_format.
+    # We'll optionally include it, and fall back (retry) at call-site if needed.
+    if use_response_format_json:
+        payload["response_format"] = {"type": "json_object"}
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
         url,
@@ -235,6 +238,17 @@ def _is_retryable_azure_error(e: Exception) -> tuple[bool, int | None, float | N
         return False, status, retry_after
     except Exception:
         return False, None, None
+
+
+def _parse_azure_http_error(e: Exception) -> dict | None:
+    """Return our structured azure_openai_http_error dict if present."""
+    try:
+        obj = json.loads(str(e))
+        if obj.get("type") == "azure_openai_http_error":
+            return obj
+    except Exception:
+        return None
+    return None
 
 
 def _prepend_sheet_explainability(
@@ -897,6 +911,7 @@ Return ONLY valid JSON with this schema:
                             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                             temperature=0.0,
                             max_tokens=500,
+                            use_response_format_json=True,
                         )
                         obj = _extract_json_content(resp)
                         rec = {
@@ -922,6 +937,47 @@ Return ONLY valid JSON with this schema:
                         break
                     except Exception as e:
                         attempt += 1
+                        # Common 400 cause in Azure: response_format unsupported. Retry once without it.
+                        parsed = _parse_azure_http_error(e)
+                        if parsed and int(parsed.get("status_code") or 0) == 400 and attempt == 1:
+                            body = str(parsed.get("body") or "").lower()
+                            if "response_format" in body or "json_object" in body:
+                                try:
+                                    resp = _azure_openai_chat_json(
+                                        endpoint=endpoint,
+                                        api_key=api_key,
+                                        deployment=deployment,
+                                        api_version=api_version,
+                                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                        temperature=0.0,
+                                        max_tokens=500,
+                                        use_response_format_json=False,
+                                    )
+                                    obj = _extract_json_content(resp)
+                                    rec = {
+                                        "INC_ID": inc_id,
+                                        "a_system": a_name,
+                                        "b_system": b_name,
+                                        "a_L1": a_labels.get("L1"),
+                                        "a_L2": a_labels.get("L2"),
+                                        "a_L3": a_labels.get("L3"),
+                                        "a_L4": a_labels.get("L4"),
+                                        "b_L1": b_labels.get("L1"),
+                                        "b_L2": b_labels.get("L2"),
+                                        "b_L3": b_labels.get("L3"),
+                                        "b_L4": b_labels.get("L4"),
+                                        "winner_overall": obj.get("winner_overall"),
+                                        "winner_correctness": obj.get("winner_correctness"),
+                                        "winner_specificity": obj.get("winner_specificity"),
+                                        "winner_actionability": obj.get("winner_actionability"),
+                                        "confidence": obj.get("confidence"),
+                                        "reason": obj.get("reason"),
+                                    }
+                                    judge_out.append(rec)
+                                    break
+                                except Exception:
+                                    # fall through to normal handling
+                                    pass
                         retryable, status, retry_after = _is_retryable_azure_error(e)
                         if retryable and attempt <= int(args.llm_judge_max_retries):
                             backoff = min(60.0, (2.0 ** min(attempt, 6)))
