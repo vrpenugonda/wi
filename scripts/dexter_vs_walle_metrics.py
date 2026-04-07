@@ -114,7 +114,7 @@ def _azure_openai_chat_json(
     api_version: str,
     messages: list[dict],
     max_completion_tokens: int = 600,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     use_response_format_json: bool = True,
 ) -> dict:
     """
@@ -154,10 +154,12 @@ def _azure_openai_chat_json(
         headers["projectId"] = project_id
     payload = {
         "messages": messages,
-        "temperature": temperature,
         # Newer models (and some Azure deployments) require max_completion_tokens instead of max_tokens.
         "max_completion_tokens": max_completion_tokens,
     }
+    # Some deployments (reasoning models) restrict/ignore temperature; omit it to use model default.
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
     # Some Azure OpenAI deployments/api-versions don't support response_format.
     # We'll optionally include it, and fall back (retry) at call-site if needed.
     if use_response_format_json:
@@ -268,6 +270,11 @@ def _parse_azure_http_error(e: Exception) -> dict | None:
 def _looks_like_max_tokens_unsupported(e: Exception) -> bool:
     s = str(e).lower()
     return "unsupported parameter" in s and "max_tokens" in s and "max_completion_tokens" in s
+
+
+def _looks_like_temperature_unsupported(e: Exception) -> bool:
+    s = str(e).lower()
+    return "unsupported value" in s and "temperature" in s and ("default" in s or "only" in s)
 
 
 def _judge_with_pydantic_ai(
@@ -997,7 +1004,6 @@ Return ONLY valid JSON with this schema:
                                     deployment=deployment,
                                     api_version=api_version,
                                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                    temperature=0.0,
                                     max_completion_tokens=500,
                                     use_response_format_json=True,
                                 )
@@ -1010,7 +1016,6 @@ Return ONLY valid JSON with this schema:
                                     deployment=deployment,
                                     api_version=api_version,
                                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                    temperature=0.0,
                                     max_completion_tokens=500,
                                     use_response_format_json=True,
                                 )
@@ -1038,10 +1043,48 @@ Return ONLY valid JSON with this schema:
                         break
                     except Exception as e:
                         attempt += 1
-                        # Common 400 cause in Azure: response_format unsupported. Retry once without it.
+                        # Common 400 causes in Azure: unsupported params. Retry once with a reduced payload.
                         parsed = _parse_azure_http_error(e)
                         if parsed and int(parsed.get("status_code") or 0) == 400 and attempt == 1:
                             body = str(parsed.get("body") or "").lower()
+                            if "temperature" in body and "default" in body:
+                                # Retry once without temperature (we already omit it, but keep this for safety
+                                # in case future edits add it back in).
+                                try:
+                                    resp = _azure_openai_chat_json(
+                                        endpoint=endpoint,
+                                        api_key=api_key,
+                                        deployment=deployment,
+                                        api_version=api_version,
+                                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                        max_completion_tokens=500,
+                                        temperature=None,
+                                        use_response_format_json=True,
+                                    )
+                                    obj = _extract_json_content(resp)
+                                    rec = {
+                                        "INC_ID": inc_id,
+                                        "a_system": a_name,
+                                        "b_system": b_name,
+                                        "a_L1": a_labels.get("L1"),
+                                        "a_L2": a_labels.get("L2"),
+                                        "a_L3": a_labels.get("L3"),
+                                        "a_L4": a_labels.get("L4"),
+                                        "b_L1": b_labels.get("L1"),
+                                        "b_L2": b_labels.get("L2"),
+                                        "b_L3": b_labels.get("L3"),
+                                        "b_L4": b_labels.get("L4"),
+                                        "winner_overall": obj.get("winner_overall"),
+                                        "winner_correctness": obj.get("winner_correctness"),
+                                        "winner_specificity": obj.get("winner_specificity"),
+                                        "winner_actionability": obj.get("winner_actionability"),
+                                        "confidence": obj.get("confidence"),
+                                        "reason": obj.get("reason"),
+                                    }
+                                    judge_out.append(rec)
+                                    break
+                                except Exception:
+                                    pass
                             if "response_format" in body or "json_object" in body:
                                 try:
                                     resp = _azure_openai_chat_json(
@@ -1050,7 +1093,6 @@ Return ONLY valid JSON with this schema:
                                         deployment=deployment,
                                         api_version=api_version,
                                         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                        temperature=0.0,
                                         max_completion_tokens=500,
                                         use_response_format_json=False,
                                     )
