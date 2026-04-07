@@ -22,6 +22,7 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 
 def _is_usable_label(v, generic: set[str]) -> bool:
@@ -139,6 +140,14 @@ def main() -> int:
     ]
     cols_present = [c for c in ordered_cols if c in df.columns]
     df_view = df[cols_present].copy()
+
+    # Sanitize illegal control characters for Excel (openpyxl restriction).
+    # These can appear in free-text fields and will crash the write.
+    obj_cols = [c for c in df_view.columns if df_view[c].dtype == "object"]
+    for c in obj_cols:
+        df_view[c] = df_view[c].apply(
+            lambda x: ILLEGAL_CHARACTERS_RE.sub("", x) if isinstance(x, str) else x
+        )
 
     # ---- Metric 1: coverage ----
     rows = len(df_view)

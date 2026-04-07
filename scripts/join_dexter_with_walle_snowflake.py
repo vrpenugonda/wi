@@ -109,6 +109,12 @@ def main() -> int:
         help="Disable dedupe and keep duplicate INGEST_TICKET_ID rows.",
     )
     parser.add_argument(
+        "--max-records",
+        type=int,
+        default=0,
+        help="Max unique INGEST_TICKET_IDs to process (post-filter/dedupe). 0 = all (default).",
+    )
+    parser.add_argument(
         "--sample-n",
         type=int,
         default=500,
@@ -149,6 +155,7 @@ def main() -> int:
     sample_n: int = int(args.sample_n)
     sample_seed: int = int(args.sample_seed)
     sample_max_per_group: int = int(args.sample_max_per_group)
+    max_records: int = int(args.max_records)
     sample_out_path = (
         Path(args.sample_out)
         if str(args.sample_out).strip()
@@ -212,6 +219,16 @@ def main() -> int:
             if dex_chunk.empty:
                 print(f"[DEX] chunk {total_chunks}: empty after filtering/dedupe, skipping")
                 continue
+
+            # Optional cap for faster debugging: stop after N unique IDs processed.
+            if max_records > 0:
+                remaining = max_records - total_dex_ids_used
+                if remaining <= 0:
+                    print(f"[DEX] reached --max-records={max_records:,}; stopping", flush=True)
+                    break
+                if len(dex_chunk) > remaining:
+                    dex_chunk = dex_chunk.iloc[:remaining].copy()
+                    print(f"[DEX] chunk {total_chunks}: truncating to {remaining:,} rows due to --max-records", flush=True)
 
             # Prefix DEX columns (only required ones; keep other cols if present but still DEX_-prefix them)
             dex_rename = {c: f"DEX_{c}" for c in dex_chunk.columns}
