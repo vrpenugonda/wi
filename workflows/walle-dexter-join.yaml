@@ -27,6 +27,26 @@ on:
         required: false
         type: number
         default: 25
+      sample_n:
+        description: "Sample size for stratified random sample (default: 500). Set 0 to disable."
+        required: false
+        type: number
+        default: 500
+      sample_seed:
+        description: "Random seed for sampling (default: 7)"
+        required: false
+        type: number
+        default: 7
+      sample_max_per_group:
+        description: "Max rows kept per (AI_L1, AI_L2, AI_L3, month) group while collecting candidates (default: 2)"
+        required: false
+        type: number
+        default: 2
+      sample_out_name:
+        description: "Sample output filename (default: <out_name>_sampled.csv)"
+        required: false
+        type: string
+        default: ""
       env:
         description: "Target environment"
         required: false
@@ -143,7 +163,19 @@ jobs:
             --out "data/output/${{ inputs.out_name }}" \
             --chunk-rows "${{ inputs.chunk_rows }}" \
             --sf-batch "${{ inputs.sf_batch }}" \
-            --sf-progress-every "${{ inputs.sf_progress_every }}"
+            --sf-progress-every "${{ inputs.sf_progress_every }}" \
+            --sample-n "${{ inputs.sample_n }}" \
+            --sample-seed "${{ inputs.sample_seed }}" \
+            --sample-max-per-group "${{ inputs.sample_max_per_group }}"
+
+          # If sample_out_name is provided, rename the sampled file accordingly.
+          if [[ -n "${{ inputs.sample_out_name }}" ]]; then
+            SAMPLE_DEFAULT="data/output/$(basename "${{ inputs.out_name }}" .csv)_sampled.csv"
+            if [[ -f "$SAMPLE_DEFAULT" ]]; then
+              mv "$SAMPLE_DEFAULT" "data/output/${{ inputs.sample_out_name }}"
+              echo "Renamed sample output to: data/output/${{ inputs.sample_out_name }}"
+            fi
+          fi
 
       - name: Upload merged output artifact
         uses: actions/upload-artifact@v4
@@ -151,5 +183,7 @@ jobs:
           name: dexter-walle-join-${{ github.run_id }}
           path: |
             data/output/${{ inputs.out_name }}
+            data/output/${{ inputs.sample_out_name }}
+            data/output/*_sampled.csv
           retention-days: 7
 
