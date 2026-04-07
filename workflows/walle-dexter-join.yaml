@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: ""
+      report_name:
+        description: "Excel report filename (default: dexter_vs_walle_report.xlsx)"
+        required: false
+        type: string
+        default: "dexter_vs_walle_report.xlsx"
       env:
         description: "Target environment"
         required: false
@@ -177,6 +182,16 @@ jobs:
             fi
           fi
 
+      - name: Run metrics (Metric 1: Coverage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          uv run python scripts/dexter_vs_walle_metrics.py \
+            --in "data/output/${{ inputs.out_name }}" \
+            --out "data/output/${{ inputs.report_name }}"
+
       - name: Upload merged output artifact
         uses: actions/upload-artifact@v4
         with:
@@ -185,5 +200,6 @@ jobs:
             data/output/${{ inputs.out_name }}
             data/output/${{ inputs.sample_out_name }}
             data/output/*_sampled.csv
+            data/output/${{ inputs.report_name }}
           retention-days: 7
 
