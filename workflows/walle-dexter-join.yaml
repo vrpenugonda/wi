@@ -188,14 +188,31 @@ jobs:
             fi
           fi
 
-      - name: Run metrics (Metric 1: Coverage)
+      - name: Run metrics on sampled data
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
 
+          # Prefer running metrics on the sampled CSV.
+          SAMPLE_PATH=""
+          if [[ -n "${{ inputs.sample_out_name }}" && -f "data/output/${{ inputs.sample_out_name }}" ]]; then
+            SAMPLE_PATH="data/output/${{ inputs.sample_out_name }}"
+          else
+            SAMPLE_DEFAULT="data/output/$(basename "${{ inputs.out_name }}" .csv)_sampled.csv"
+            if [[ -f "$SAMPLE_DEFAULT" ]]; then
+              SAMPLE_PATH="$SAMPLE_DEFAULT"
+            fi
+          fi
+
+          if [[ -z "$SAMPLE_PATH" ]]; then
+            echo "::error::No sampled CSV found. Ensure sample_n > 0 and the join step produced a *_sampled.csv file."
+            exit 1
+          fi
+
+          echo "Running metrics on sample: $SAMPLE_PATH"
           uv run python scripts/dexter_vs_walle_metrics.py \
-            --in "data/output/${{ inputs.out_name }}" \
+            --in "$SAMPLE_PATH" \
             --out "data/output/${{ inputs.report_name }}"
 
       - name: Upload merged output artifact
