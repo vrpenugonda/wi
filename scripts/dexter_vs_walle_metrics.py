@@ -990,36 +990,9 @@ Return ONLY valid JSON with this schema:
                 attempt = 0
                 while True:
                     try:
-                        # Prefer the same stack as L4 classification (pydantic-ai Agent).
-                        # If the deployed model rejects max_tokens (some newer models), pydantic-ai may error;
-                        # in that case fall back to the REST call which uses max_completion_tokens.
-                        try:
-                            obj = _judge_with_pydantic_ai(system_prompt=system, user_prompt=user)
-                        except Exception as pe:
-                            if _looks_like_max_tokens_unsupported(pe):
-                                # Force REST path (uses max_completion_tokens).
-                                resp = _azure_openai_chat_json(
-                                    endpoint=endpoint,
-                                    api_key=api_key,
-                                    deployment=deployment,
-                                    api_version=api_version,
-                                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                    max_completion_tokens=500,
-                                    use_response_format_json=True,
-                                )
-                                obj = _extract_json_content(resp)
-                            else:
-                                # Generic fallback to REST call (useful if pydantic-ai isn't available).
-                                resp = _azure_openai_chat_json(
-                                    endpoint=endpoint,
-                                    api_key=api_key,
-                                    deployment=deployment,
-                                    api_version=api_version,
-                                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                    max_completion_tokens=500,
-                                    use_response_format_json=True,
-                                )
-                                obj = _extract_json_content(resp)
+                        # IDENTICAL to L4 approach: pydantic-ai Agent + OpenAIChatModel(provider="azure")
+                        # with gateway headers via OpenAIChatModelSettings. No REST fallback.
+                        obj = _judge_with_pydantic_ai(system_prompt=system, user_prompt=user)
                         rec = {
                             "INC_ID": inc_id,
                             "a_system": a_name,
@@ -1043,84 +1016,8 @@ Return ONLY valid JSON with this schema:
                         break
                     except Exception as e:
                         attempt += 1
-                        # Common 400 causes in Azure: unsupported params. Retry once with a reduced payload.
-                        parsed = _parse_azure_http_error(e)
-                        if parsed and int(parsed.get("status_code") or 0) == 400 and attempt == 1:
-                            body = str(parsed.get("body") or "").lower()
-                            if "temperature" in body and "default" in body:
-                                # Retry once without temperature (we already omit it, but keep this for safety
-                                # in case future edits add it back in).
-                                try:
-                                    resp = _azure_openai_chat_json(
-                                        endpoint=endpoint,
-                                        api_key=api_key,
-                                        deployment=deployment,
-                                        api_version=api_version,
-                                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                        max_completion_tokens=500,
-                                        temperature=None,
-                                        use_response_format_json=True,
-                                    )
-                                    obj = _extract_json_content(resp)
-                                    rec = {
-                                        "INC_ID": inc_id,
-                                        "a_system": a_name,
-                                        "b_system": b_name,
-                                        "a_L1": a_labels.get("L1"),
-                                        "a_L2": a_labels.get("L2"),
-                                        "a_L3": a_labels.get("L3"),
-                                        "a_L4": a_labels.get("L4"),
-                                        "b_L1": b_labels.get("L1"),
-                                        "b_L2": b_labels.get("L2"),
-                                        "b_L3": b_labels.get("L3"),
-                                        "b_L4": b_labels.get("L4"),
-                                        "winner_overall": obj.get("winner_overall"),
-                                        "winner_correctness": obj.get("winner_correctness"),
-                                        "winner_specificity": obj.get("winner_specificity"),
-                                        "winner_actionability": obj.get("winner_actionability"),
-                                        "confidence": obj.get("confidence"),
-                                        "reason": obj.get("reason"),
-                                    }
-                                    judge_out.append(rec)
-                                    break
-                                except Exception:
-                                    pass
-                            if "response_format" in body or "json_object" in body:
-                                try:
-                                    resp = _azure_openai_chat_json(
-                                        endpoint=endpoint,
-                                        api_key=api_key,
-                                        deployment=deployment,
-                                        api_version=api_version,
-                                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                        max_completion_tokens=500,
-                                        use_response_format_json=False,
-                                    )
-                                    obj = _extract_json_content(resp)
-                                    rec = {
-                                        "INC_ID": inc_id,
-                                        "a_system": a_name,
-                                        "b_system": b_name,
-                                        "a_L1": a_labels.get("L1"),
-                                        "a_L2": a_labels.get("L2"),
-                                        "a_L3": a_labels.get("L3"),
-                                        "a_L4": a_labels.get("L4"),
-                                        "b_L1": b_labels.get("L1"),
-                                        "b_L2": b_labels.get("L2"),
-                                        "b_L3": b_labels.get("L3"),
-                                        "b_L4": b_labels.get("L4"),
-                                        "winner_overall": obj.get("winner_overall"),
-                                        "winner_correctness": obj.get("winner_correctness"),
-                                        "winner_specificity": obj.get("winner_specificity"),
-                                        "winner_actionability": obj.get("winner_actionability"),
-                                        "confidence": obj.get("confidence"),
-                                        "reason": obj.get("reason"),
-                                    }
-                                    judge_out.append(rec)
-                                    break
-                                except Exception:
-                                    # fall through to normal handling
-                                    pass
+                        # Keep a small retry loop for transient gateway/availability issues.
+                        # We don't attempt payload mutation or alternate clients (no fallback).
                         retryable, status, retry_after = _is_retryable_azure_error(e)
                         if retryable and attempt <= int(args.llm_judge_max_retries):
                             backoff = min(60.0, (2.0 ** min(attempt, 6)))
@@ -1128,14 +1025,12 @@ Return ONLY valid JSON with this schema:
                             time.sleep(float(sleep_for))
                             continue
                         failures += 1
-                        parsed_err = _parse_azure_http_error(e)
                         judge_out.append(
                             {
                                 "INC_ID": inc_id,
                                 "error": str(e)[:800],
                                 "status_code": status,
                                 "attempts": attempt,
-                                "error_body": (parsed_err.get("body") if parsed_err else None),
                             }
                         )
                         break
