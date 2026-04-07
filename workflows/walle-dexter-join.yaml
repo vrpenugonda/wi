@@ -1,0 +1,155 @@
+name: WALLE - Join DEXter CSV with WALLE Snowflake
+
+on:
+  workflow_dispatch:
+    inputs:
+      dex_s3_key:
+        description: "S3 key for DEXter CSV (e.g. walle/insights/artifacts/dexter/my_dex.csv)"
+        required: true
+        type: string
+      out_name:
+        description: "Output filename (default: merged_dex_walle.csv)"
+        required: false
+        type: string
+        default: "merged_dex_walle.csv"
+      chunk_rows:
+        description: "DEX chunk rows (default: 200000)"
+        required: false
+        type: number
+        default: 200000
+      sf_batch:
+        description: "Snowflake IN() batch size (default: 1000)"
+        required: false
+        type: number
+        default: 1000
+      sf_progress_every:
+        description: "Print Snowflake batch progress every N batches (default: 25)"
+        required: false
+        type: number
+        default: 25
+      env:
+        description: "Target environment"
+        required: false
+        type: choice
+        options: [dev, stage, prod]
+        default: prod
+
+concurrency:
+  group: walle-dexter-join
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  dexter_join:
+    name: Join DEXter with WALLE
+    runs-on: uhg-runner
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        shell: bash
+        timeout-minutes: 10
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Download DEXter CSV from S3
+        shell: bash
+        env:
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL || 'https://s3api-core.optum.com' }}
+          DEX_S3_KEY: ${{ inputs.dex_s3_key }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          python - << 'PY'
+          import os
+          from pathlib import Path
+          import boto3
+
+          bucket = os.environ["S3_BUCKET_NAME"]
+          key = os.environ["DEX_S3_KEY"]
+          endpoint = os.environ["S3_ENDPOINT_URL"]
+
+          out_dir = Path("data/input")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out_path = out_dir / "dexter.csv"
+
+          s3 = boto3.client(
+              "s3",
+              aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+              endpoint_url=endpoint,
+          )
+
+          print(f"Downloading s3://{bucket}/{key} -> {out_path}", flush=True)
+          s3.download_file(bucket, key, str(out_path))
+          print("Download complete", flush=True)
+          PY
+
+      - name: Run join script
+        shell: bash
+        env:
+          # Snowflake creds (same pattern as other workflows)
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+          SNOWFLAKE_TABLE: ${{ secrets.SNOWFLAKE_TABLE || 'WALLE_CLASSIFIED_INCIDENTS' }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          mkdir -p data/output
+
+          uv run python scripts/join_dexter_with_walle_snowflake.py \
+            --dex-csv "data/input/dexter.csv" \
+            --out "data/output/${{ inputs.out_name }}" \
+            --chunk-rows "${{ inputs.chunk_rows }}" \
+            --sf-batch "${{ inputs.sf_batch }}" \
+            --sf-progress-every "${{ inputs.sf_progress_every }}"
+
+      - name: Upload merged output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dexter-walle-join-${{ github.run_id }}
+          path: |
+            data/output/${{ inputs.out_name }}
+          retention-days: 7
+
