@@ -27,6 +27,11 @@ on:
         required: false
         type: number
         default: 25
+      max_records:
+        description: "Max unique DEXter ticket IDs to process (debug). 0 = all (default)."
+        required: false
+        type: number
+        default: 0
       sample_n:
         description: "Sample size for stratified random sample (default: 500). Set 0 to disable."
         required: false
@@ -169,6 +174,7 @@ jobs:
             --chunk-rows "${{ inputs.chunk_rows }}" \
             --sf-batch "${{ inputs.sf_batch }}" \
             --sf-progress-every "${{ inputs.sf_progress_every }}" \
+            --max-records "${{ inputs.max_records }}" \
             --sample-n "${{ inputs.sample_n }}" \
             --sample-seed "${{ inputs.sample_seed }}" \
             --sample-max-per-group "${{ inputs.sample_max_per_group }}"
