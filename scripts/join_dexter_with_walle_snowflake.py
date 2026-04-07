@@ -52,6 +52,28 @@ def _batched(items: list[str], batch_size: int) -> Iterable[list[str]]:
         yield items[i : i + batch_size]
 
 
+def _is_nonempty_str(v) -> bool:
+    if v is None:
+        return False
+    if pd.isna(v):
+        return False
+    s = str(v).strip()
+    return s != "" and s.lower() != "none"
+
+
+def _month_bucket(row: pd.Series) -> str | None:
+    """
+    Return YYYY-MM month bucket from WALLE_CLOSED_AT (preferred) or WALLE_OPENED_AT.
+    """
+    for col in ("WALLE_CLOSED_AT", "WALLE_OPENED_AT"):
+        if col in row and _is_nonempty_str(row[col]):
+            ts = pd.to_datetime(row[col], errors="coerce")
+            if pd.isna(ts):
+                continue
+            return f"{int(ts.year):04d}-{int(ts.month):02d}"
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Join DEXter CSV with WALLE Snowflake records by ticket ID.")
     parser.add_argument("--dex-csv", required=True, help="Path to DEXter output CSV")
@@ -86,6 +108,29 @@ def main() -> int:
         action="store_false",
         help="Disable dedupe and keep duplicate INGEST_TICKET_ID rows.",
     )
+    parser.add_argument(
+        "--sample-n",
+        type=int,
+        default=500,
+        help="Number of matched incidents to sample (default: 500). Set 0 to disable sampling.",
+    )
+    parser.add_argument(
+        "--sample-out",
+        default="",
+        help="Optional path for sampled output CSV. Default is '<out>_sampled.csv'.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=7,
+        help="Random seed for sampling (default: 7).",
+    )
+    parser.add_argument(
+        "--sample-max-per-group",
+        type=int,
+        default=2,
+        help="Max samples to keep per (AI_L1, AI_L2, AI_L3, month) group during collection (default: 2).",
+    )
     args = parser.parse_args()
 
     dex_path = Path(args.dex_csv)
@@ -100,6 +145,15 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         out_path.unlink()
+
+    sample_n: int = int(args.sample_n)
+    sample_seed: int = int(args.sample_seed)
+    sample_max_per_group: int = int(args.sample_max_per_group)
+    sample_out_path = (
+        Path(args.sample_out)
+        if str(args.sample_out).strip()
+        else out_path.with_suffix("").with_name(out_path.stem + "_sampled.csv")
+    )
 
     seen_ids: set[str] = set()
 
@@ -124,6 +178,10 @@ def main() -> int:
         total_chunks = 0
         total_dex_rows_seen = 0
         total_dex_ids_used = 0
+
+        # Collect diverse sampling candidates without loading the full merged output.
+        # Group key: (AI_L1, AI_L2, AI_L3, month_bucket)
+        sample_candidates: dict[tuple[str, str, str, str], list[dict]] = {}
 
         for dex_chunk in pd.read_csv(dex_path, chunksize=chunk_rows):
             total_chunks += 1
@@ -219,11 +277,56 @@ def main() -> int:
             first_write = False
             total_out += len(merged)
 
+            # Sampling: select a diverse subset spanning AI_L1/L2/L3 and multiple months.
+            # Only consider rows where WALLE_AI_L1/L2/L3 are non-null/non-empty.
+            if sample_n > 0 and {"WALLE_AI_L1", "WALLE_AI_L2", "WALLE_AI_L3"}.issubset(merged.columns):
+                eligible = merged[
+                    merged["WALLE_AI_L1"].apply(_is_nonempty_str)
+                    & merged["WALLE_AI_L2"].apply(_is_nonempty_str)
+                    & merged["WALLE_AI_L3"].apply(_is_nonempty_str)
+                ].copy()
+
+                if not eligible.empty:
+                    eligible["__MONTH__"] = eligible.apply(_month_bucket, axis=1)
+                    eligible = eligible[eligible["__MONTH__"].notna()]
+
+                if not eligible.empty:
+                    for _row in eligible.itertuples(index=False):
+                        d = _row._asdict()
+                        key = (
+                            str(d.get("WALLE_AI_L1")).strip(),
+                            str(d.get("WALLE_AI_L2")).strip(),
+                            str(d.get("WALLE_AI_L3")).strip(),
+                            str(d.get("__MONTH__")).strip(),
+                        )
+                        bucket = sample_candidates.get(key)
+                        if bucket is None:
+                            bucket = []
+                            sample_candidates[key] = bucket
+                        if len(bucket) < sample_max_per_group:
+                            d.pop("__MONTH__", None)
+                            bucket.append(d)
+
             print(
                 f"[JOIN] chunk {total_chunks}: wrote {len(merged):,} rows "
                 f"(total written: {total_out:,})"
             )
             print(f"[TIME] chunk {total_chunks}: {time.time() - t0:.1f}s", flush=True)
+
+        # Write sampled output (if enabled)
+        if sample_n > 0:
+            flat: list[dict] = []
+            for rows in sample_candidates.values():
+                flat.extend(rows)
+
+            sample_df = pd.DataFrame(flat)
+            if sample_df.empty:
+                print("[SAMPLE] no eligible rows collected (requires non-null WALLE_AI_L1/L2/L3 and a date column)", flush=True)
+            else:
+                if len(sample_df) > sample_n:
+                    sample_df = sample_df.sample(n=sample_n, random_state=sample_seed)
+                sample_df.to_csv(sample_out_path, index=False)
+                print(f"[SAMPLE] wrote {len(sample_df):,} rows to {sample_out_path}", flush=True)
 
         print(
             f"Done.\n"
