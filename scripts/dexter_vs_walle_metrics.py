@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from urllib import request, error
 from urllib.parse import urlencode
+from typing import Any
 
 import pandas as pd
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -139,6 +140,18 @@ def _azure_openai_chat_json(
         headers["Authorization"] = f"Bearer {token}"
     else:
         headers["api-key"] = token
+
+    # Best-effort: mirror gateway headers used by the main classifiers.
+    # These may be required by upstream API gateways for routing/telemetry.
+    import os
+    x_upstream_env = (os.getenv("X_UPSTREAM_ENV") or os.getenv("X-Upstream-Env") or "").strip()
+    project_id = (os.getenv("PROJECT_ID") or os.getenv("projectId") or "").strip()
+    if x_upstream_env:
+        headers["X-Upstream-Env"] = x_upstream_env
+        headers["X-Model-Usage-Type"] = x_upstream_env
+        headers["modelUsageType"] = x_upstream_env
+    if project_id:
+        headers["projectId"] = project_id
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -249,6 +262,67 @@ def _parse_azure_http_error(e: Exception) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def _judge_with_pydantic_ai(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, Any]:
+    """
+    Run a single judge request using the same stack as L4 classification:
+    pydantic-ai Agent + OpenAIChatModel(provider='azure') + extra_headers.
+
+    Expects env vars to be set by the workflow:
+      - AZURE_OPENAI_API_KEY (AAD token)
+      - AZURE_OPENAI_ENDPOINT
+      - AZURE_OPENAI_API_VERSION
+      - AZURE_OPENAI_DEPLOYMENT_NAME
+      - X_UPSTREAM_ENV / PROJECT_ID (optional gateway headers)
+    """
+    import os
+    import asyncio
+    from pydantic import BaseModel, Field
+    from pydantic_ai import Agent
+    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+
+    class JudgeOut(BaseModel):
+        winner_overall: str = Field(...)
+        winner_correctness: str = Field(...)
+        winner_specificity: str = Field(...)
+        winner_actionability: str = Field(...)
+        confidence: float = Field(...)
+        reason: str = Field(...)
+
+    deployment = (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip()
+    if not deployment:
+        raise RuntimeError("Missing AZURE_OPENAI_DEPLOYMENT_NAME for pydantic-ai judge")
+
+    model = OpenAIChatModel(deployment, provider="azure")
+    x_upstream_env = (os.getenv("X_UPSTREAM_ENV") or os.getenv("X-Upstream-Env") or "").strip()
+    project_id = (os.getenv("PROJECT_ID") or os.getenv("projectId") or "").strip()
+    extra_headers: dict[str, str] = {}
+    if x_upstream_env:
+        extra_headers.update(
+            {
+                "X-Upstream-Env": x_upstream_env,
+                "projectId": project_id,
+                "X-Model-Usage-Type": x_upstream_env,
+                "modelUsageType": x_upstream_env,
+            }
+        )
+    elif project_id:
+        extra_headers["projectId"] = project_id
+
+    settings = OpenAIChatModelSettings(extra_headers=extra_headers) if extra_headers else OpenAIChatModelSettings()
+    agent = Agent(model, output_type=JudgeOut, model_settings=settings, system_prompt=system_prompt)
+
+    async def _run() -> JudgeOut:
+        res = await agent.run(user_prompt)
+        return res.data
+
+    out = asyncio.run(_run())
+    return out.model_dump()
 
 
 def _prepend_sheet_explainability(
@@ -903,17 +977,22 @@ Return ONLY valid JSON with this schema:
                 attempt = 0
                 while True:
                     try:
-                        resp = _azure_openai_chat_json(
-                            endpoint=endpoint,
-                            api_key=api_key,
-                            deployment=deployment,
-                            api_version=api_version,
-                            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                            temperature=0.0,
-                            max_tokens=500,
-                            use_response_format_json=True,
-                        )
-                        obj = _extract_json_content(resp)
+                        # Prefer the same stack as L4 classification (pydantic-ai Agent).
+                        try:
+                            obj = _judge_with_pydantic_ai(system_prompt=system, user_prompt=user)
+                        except Exception:
+                            # Fallback to raw REST call (useful if pydantic-ai isn't available).
+                            resp = _azure_openai_chat_json(
+                                endpoint=endpoint,
+                                api_key=api_key,
+                                deployment=deployment,
+                                api_version=api_version,
+                                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                temperature=0.0,
+                                max_tokens=500,
+                                use_response_format_json=True,
+                            )
+                            obj = _extract_json_content(resp)
                         rec = {
                             "INC_ID": inc_id,
                             "a_system": a_name,
@@ -985,12 +1064,14 @@ Return ONLY valid JSON with this schema:
                             time.sleep(float(sleep_for))
                             continue
                         failures += 1
+                        parsed_err = _parse_azure_http_error(e)
                         judge_out.append(
                             {
                                 "INC_ID": inc_id,
                                 "error": str(e)[:800],
                                 "status_code": status,
                                 "attempts": attempt,
+                                "error_body": (parsed_err.get("body") if parsed_err else None),
                             }
                         )
                         break
