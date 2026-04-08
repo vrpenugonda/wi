@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from urllib import request, error
 from urllib.parse import urlencode
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -277,9 +277,414 @@ def _looks_like_temperature_unsupported(e: Exception) -> bool:
     return "unsupported value" in s and "temperature" in s and ("default" in s or "only" in s)
 
 
+# Knowledge placeholders when fields are not in the incident extract.
+_LLM_JUDGE_KB_NA = "[Not available in incident extract]"
+
+_LLM_JUDGE_SYSTEM = (
+    "You are a neutral expert evaluator for IT service desk incident classification. "
+    "Follow the user message rubric exactly. Populate the structured output: "
+    "seven dimensions for WALLE and seven for DEX (each score is 0, 1, 2, 3, 4, or N); "
+    "reasoning strings; D5/D6 example fields; per-model summary averages; final verdict. "
+    "Do not claim one model is globally superior—this incident only."
+)
+
+
+def _build_llm_judge_incident_fields(
+    row: pd.Series,
+    *,
+    safe_txt: Callable[[Any], str],
+    columns: set[str],
+) -> dict[str, str]:
+    """Map merged CSV columns to the judge prompt incident placeholders."""
+
+    def g(col: str) -> str:
+        if col not in columns:
+            return ""
+        return safe_txt(row.get(col))
+
+    def concat_labeled(pairs: list[tuple[str, str]]) -> str:
+        lines = [f"{lab}: {txt}" for lab, txt in pairs if txt]
+        return "\n".join(lines) if lines else "(none)"
+
+    customer = g("INC_BRIEF_DESCRIPTION")
+    if g("INC_UH_ESS_ERRORMSG"):
+        customer = (customer + "\n" + f"INC_UH_ESS_ERRORMSG: {g('INC_UH_ESS_ERRORMSG')}").strip()
+
+    long_desc = concat_labeled(
+        [
+            ("INC_ACTION", g("INC_ACTION")),
+            ("INC_COMMENTS", g("INC_COMMENTS")),
+            ("INC_UPDATE_ACTION", g("INC_UPDATE_ACTION")),
+        ]
+    )
+    work_notes = concat_labeled(
+        [
+            ("INC_COMMENTS", g("INC_COMMENTS")),
+            ("INC_UH_MONITORING_NOTES", g("INC_UH_MONITORING_NOTES")),
+        ]
+    )
+    steps = concat_labeled(
+        [
+            ("INC_UPDATE_ACTION_ESS", g("INC_UPDATE_ACTION_ESS")),
+            ("INC_UPDATE_ACTION", g("INC_UPDATE_ACTION")),
+        ]
+    )
+
+    return {
+        "inc_id": g("INC_ID") or "(unknown)",
+        "inc_customer_states": customer or "(none)",
+        "inc_long_description": long_desc or "(none)",
+        "inc_resolution": g("INC_RESOLUTION") or "(none)",
+        "inc_work_notes": work_notes or "(none)",
+        "inc_steps_taken": steps or "(none)",
+        "inc_kb_issue": _LLM_JUDGE_KB_NA,
+        "inc_kb_fix": _LLM_JUDGE_KB_NA,
+    }
+
+
+def _llm_judge_user_prompt(*, incident: dict[str, str], walle: dict[str, str], dex: dict[str, str]) -> str:
+    """Full rubric + incident + classifications (WALLE and DEX named explicitly)."""
+    return f"""You are a neutral expert evaluator assessing the quality of two AI-generated
+incident classification outputs — WALLE and DEX — for a single IT
+service desk incident.
+
+Your evaluation has two equally weighted objectives:
+
+  OBJECTIVE 1 — ACCURACY
+  Does the classification correctly reflect what happened in this incident,
+  as evidenced by the incident record?
+
+  OBJECTIVE 2 — BUSINESS ACTIONABILITY
+  Does the classification produce outputs that a business can act on —
+  specifically to drive automation, eliminate recurring incident causes,
+  redesign processes, or reduce incident volume for that category?
+
+A classification that is accurate but not actionable has limited business
+value. A classification that is actionable but inaccurate will drive
+automation in the wrong direction. Both objectives must be satisfied.
+
+---
+
+## INCIDENT RECORD
+
+Incident ID:                  {incident["inc_id"]}
+Customer stated:              {incident["inc_customer_states"]}
+Long description:             {incident["inc_long_description"]}
+Resolution applied:           {incident["inc_resolution"]}
+Work notes:                   {incident["inc_work_notes"]}
+Steps taken:                  {incident["inc_steps_taken"]}
+Knowledge article — issue:    {incident["inc_kb_issue"]}
+Knowledge article — fix:      {incident["inc_kb_fix"]}
+
+---
+
+## CLASSIFICATION OUTPUTS
+
+WALLE:
+  Domain (L1):      {walle["L1"]}
+  Category (L2):    {walle["L2"]}
+  Subcategory (L3): {walle["L3"]}
+  Key Issue (L4):   {walle["L4"]}
+
+DEX:
+  Domain (L1):      {dex["L1"]}
+  Category (L2):    {dex["L2"]}
+  Subcategory (L3): {dex["L3"]}
+  Key Issue (L4):   {dex["L4"]}
+
+---
+
+## EVALUATION INSTRUCTIONS
+
+Score each model on the seven dimensions below.
+Score each model INDEPENDENTLY — do not compare them to each other
+when assigning scores. Both models can receive the same score on any
+dimension.
+
+SCORING SCALE:
+  4 = Fully meets the dimension criteria
+  3 = Mostly meets the criteria with minor gaps
+  2 = Partially meets the criteria, notable gaps
+  1 = Weakly meets the criteria, significant gaps
+  0 = Does not meet the criteria or actively contradicts it
+  N = Not applicable (field missing or dimension cannot be assessed)
+
+GROUND RULES — read before scoring:
+  - Evaluate ALL INC_ field groups with equal weight. Do not allow the
+    customer statement alone to dominate your judgment. Resolution text,
+    work notes, steps taken, and knowledge article references are equally
+    valid evidence.
+  - A null or missing L4 Key Issue field is NOT automatically a failure.
+    If the incident narrative is ambiguous or sparse, null is a legitimate
+    and calibrated response. Score it 2 unless the incident clearly had
+    enough signal to classify, in which case score 1.
+  - A populated L4 field is NOT automatically a success. If the label does
+    not align with evidence or business use, score it low regardless of
+    whether it is filled in.
+  - Do not penalise a model for taxonomy vocabulary differences. Evaluate
+    alignment to the incident and to business utility — not alignment to
+    the other model's label format.
+
+---
+
+## SECTION 1 — ACCURACY DIMENSIONS (50% of total score)
+
+DIMENSION 1 — Problem Identification Accuracy
+Does the classification correctly identify what the actual problem was,
+as evidenced by the customer statement and long description?
+A good classification names the affected system, service, or component
+and the nature of the failure the user experienced.
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+
+---
+
+DIMENSION 2 — Resolution Alignment
+Does the classification align with how the incident was actually resolved,
+as evidenced by the resolution text and work notes?
+A good classification should not contradict the resolution path taken.
+Consider: if you only read the classification, would you be pointed in the
+right direction to fix this type of incident in future?
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+
+---
+
+DIMENSION 3 — Knowledge Article Consistency
+Where a knowledge article is referenced, does the classification align
+with the issue and resolution described in that article?
+If no knowledge article is present, mark both models N.
+
+  WALLE score (0-4 or N):
+  Reasoning (2-3 sentences):
+
+  DEX score (0-4 or N):
+  Reasoning (2-3 sentences):
+
+---
+
+DIMENSION 4 — Taxonomy Internal Consistency
+Are all four levels (L1 through L4) logically consistent with each other?
+Does L2 follow naturally from L1? Does L3 follow from L2? Does L4 follow
+from L3? A classification with internally contradictory levels will
+produce unreliable aggregations and misleading trend reports regardless
+of whether individual levels are accurate.
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+
+---
+
+## SECTION 2 — BUSINESS ACTIONABILITY DIMENSIONS (50% of total score)
+
+For each dimension below, consider what a business operations team,
+automation engineer, or service improvement manager could realistically
+do with this classification output at scale.
+
+---
+
+DIMENSION 5 — Automation Potential
+Could this classification directly trigger or inform an automated
+resolution workflow, virtual agent script, or self-service deflection?
+
+Consider:
+  - Is the classified issue type specific enough to map to a known
+    automated fix? (e.g. account unlock, VPN reset, cache clear,
+    PIN reset, device compliance check)
+  - Does the classification distinguish between incident types that
+    require different automation paths, or does it group them into
+    a category too broad to automate against?
+  - If this classification were used as a routing label to an
+    automation engine, would the engine know what to execute?
+
+Penalise vague or catch-all labels only when the incident record
+contained enough information to produce a specific, automatable label.
+Do not penalise appropriate abstraction when the incident itself was
+genuinely ambiguous.
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+  Example automation action this classification could enable (if any):
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+  Example automation action this classification could enable (if any):
+
+---
+
+DIMENSION 6 — Process Improvement and Incident Reduction Signal
+Could this classification, when aggregated across hundreds or thousands
+of similar incidents, reveal a pattern that a process owner or IT
+operations manager could act on to reduce incident volume?
+
+Consider:
+  - Does the classification reveal a root cause or failure mode that
+    could be addressed upstream? (e.g. a recurring onboarding gap,
+    a policy configuration that repeatedly locks users out, a software
+    deployment that consistently fails on a specific device model)
+  - Is the classification specific enough to distinguish actionable
+    patterns from noise? A label of "Software / Error" tells a manager
+    nothing. A label of "Windows Hello PIN Reset Required — post device
+    replacement" tells them exactly where to intervene.
+  - Does the classification capture enough context that a Problem
+    Management team could use it to open a Problem ticket and drive
+    a permanent fix?
+  - Would grouping incidents by this classification produce meaningful
+    cohorts for trend analysis, or would it lump unrelated incidents
+    together?
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+  Example process improvement or incident reduction this could drive:
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+  Example process improvement or incident reduction this could drive:
+
+---
+
+DIMENSION 7 — Executive Reporting and Strategic Decision Support
+Could this classification contribute to meaningful executive-level
+reporting on IT health, workforce productivity impact, and technology
+investment priorities?
+
+Consider:
+  - Is the classification specific enough to appear as a meaningful
+    category in a dashboard without requiring manual reclassification
+    or post-processing?
+  - Does it support trend analysis over time — i.e. could a leader
+    track whether this incident type is increasing, decreasing, or
+    shifting to different products?
+  - Does it attribute the incident to a product, service, or platform
+    in a way that could inform vendor management, contract decisions,
+    or technology refresh priorities?
+  - Would a non-technical executive understand what this classification
+    represents, or would it require significant translation?
+
+  WALLE score (0-4):
+  Reasoning (2-3 sentences):
+
+  DEX score (0-4):
+  Reasoning (2-3 sentences):
+
+---
+
+## FINAL SCORING SUMMARY
+
+List scores for all applicable dimensions and calculate averages.
+Exclude any dimension marked N from both the numerator and denominator.
+Show your working clearly in the structured output fields (applicable_dimensions lists which D1-D7 counted; averages are numeric).
+
+WALLE and DEX each need:
+  D1 Problem Identification through D7 Executive Reporting scores (or N),
+  applicable_dimensions list,
+  Section 1 average (D1-D4),
+  Section 2 average (D5-D7),
+  Overall average (equal weight over applicable dimensions).
+
+---
+
+## VERDICT
+
+Declare a winner or a tie. A tie is declared if overall averages
+are within 0.25 of each other.
+
+State separately whether one model led on accuracy while the other
+led on actionability — this split verdict is important because the
+two objectives may be best served by different models in combination
+rather than a single winner replacing the other.
+
+Overall verdict:              [WALLE / DEX / Tie]
+Accuracy leader:              [WALLE / DEX / Equal]
+Actionability leader:         [WALLE / DEX / Equal]
+Dimension with largest gap:   [D1-D7 or None]
+One-sentence summary:
+
+IMPORTANT — do not make any general claim about which model is
+superior overall. Your verdict applies to this single incident only.
+Cumulative conclusions across incidents must be drawn by a human
+reviewer after all incidents are scored.
+
+---
+
+Your response must be provided ONLY through the structured output schema (no extra prose outside it).
+"""
+
+
+def _flatten_judge_out_for_excel(
+    inc_id: str,
+    walle_labels: dict[str, str],
+    dex_labels: dict[str, str],
+    obj: dict[str, Any],
+) -> dict[str, Any]:
+    """One wide row for metric_6_llm_judge_rows."""
+    out: dict[str, Any] = {
+        "INC_ID": inc_id,
+        "WALLE_L1": walle_labels.get("L1"),
+        "WALLE_L2": walle_labels.get("L2"),
+        "WALLE_L3": walle_labels.get("L3"),
+        "WALLE_L4": walle_labels.get("L4"),
+        "DEX_L1": dex_labels.get("L1"),
+        "DEX_L2": dex_labels.get("L2"),
+        "DEX_L3": dex_labels.get("L3"),
+        "DEX_L4": dex_labels.get("L4"),
+    }
+    w = obj.get("walle") or {}
+    d = obj.get("dex") or {}
+    dim_map = [
+        ("d1_problem_identification", "D1"),
+        ("d2_resolution_alignment", "D2"),
+        ("d3_knowledge_article", "D3"),
+        ("d4_taxonomy_consistency", "D4"),
+        ("d5_automation", "D5"),
+        ("d6_process_improvement", "D6"),
+        ("d7_executive_reporting", "D7"),
+    ]
+    for field, tag in dim_map:
+        wb = w.get(field) or {}
+        db = d.get(field) or {}
+        out[f"walle_{tag}_score"] = wb.get("score")
+        out[f"walle_{tag}_reasoning"] = wb.get("reasoning")
+        out[f"dex_{tag}_score"] = db.get("score")
+        out[f"dex_{tag}_reasoning"] = db.get("reasoning")
+        if tag == "D5":
+            out["walle_D5_example_automation"] = wb.get("example_automation", "")
+            out["dex_D5_example_automation"] = db.get("example_automation", "")
+        if tag == "D6":
+            out["walle_D6_example_process_improvement"] = wb.get("example_process_improvement", "")
+            out["dex_D6_example_process_improvement"] = db.get("example_process_improvement", "")
+    ws = obj.get("walle_summary") or {}
+    ds = obj.get("dex_summary") or {}
+    out["walle_applicable_dimensions"] = ws.get("applicable_dimensions")
+    out["walle_section1_avg"] = ws.get("section1_average")
+    out["walle_section2_avg"] = ws.get("section2_average")
+    out["walle_overall_avg"] = ws.get("overall_average")
+    out["dex_applicable_dimensions"] = ds.get("applicable_dimensions")
+    out["dex_section1_avg"] = ds.get("section1_average")
+    out["dex_section2_avg"] = ds.get("section2_average")
+    out["dex_overall_avg"] = ds.get("overall_average")
+    ver = obj.get("verdict") or {}
+    out["verdict_overall"] = ver.get("overall_verdict")
+    out["verdict_accuracy_leader"] = ver.get("accuracy_leader")
+    out["verdict_actionability_leader"] = ver.get("actionability_leader")
+    out["verdict_dimension_largest_gap"] = ver.get("dimension_largest_gap")
+    out["verdict_one_sentence_summary"] = ver.get("one_sentence_summary")
+    return out
+
+
 def _judge_with_pydantic_ai(
     *,
-    system_prompt: str,
     user_prompt: str,
 ) -> dict[str, Any]:
     """
@@ -299,13 +704,54 @@ def _judge_with_pydantic_ai(
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
+    class DimScore(BaseModel):
+        score: str = Field(..., description="Exactly one of: 0, 1, 2, 3, 4, N")
+        reasoning: str = Field(..., description="2-3 sentences")
+
+    class Dim5Score(BaseModel):
+        score: str = Field(..., description="0-4 or N")
+        reasoning: str = Field(..., description="2-3 sentences")
+        example_automation: str = Field(default="", description="Short phrase or empty")
+
+    class Dim6Score(BaseModel):
+        score: str = Field(..., description="0-4 or N")
+        reasoning: str = Field(..., description="2-3 sentences")
+        example_process_improvement: str = Field(default="", description="Short phrase or empty")
+
+    class ModelEvalScores(BaseModel):
+        d1_problem_identification: DimScore
+        d2_resolution_alignment: DimScore
+        d3_knowledge_article: DimScore
+        d4_taxonomy_consistency: DimScore
+        d5_automation: Dim5Score
+        d6_process_improvement: Dim6Score
+        d7_executive_reporting: DimScore
+
+    class ModelSummary(BaseModel):
+        applicable_dimensions: str = Field(
+            ...,
+            description="Comma-separated e.g. D1,D2,D3,D4,D5,D6,D7 — exclude dimensions scored N",
+        )
+        section1_average: float = Field(..., description="Mean of D1-D4 numeric scores only, 0-4 scale")
+        section2_average: float = Field(..., description="Mean of D5-D7 numeric scores only, 0-4 scale")
+        overall_average: float = Field(
+            ...,
+            description="Equal-weight mean over all applicable numeric dimensions, 0-4 scale",
+        )
+
+    class VerdictOut(BaseModel):
+        overall_verdict: str = Field(..., description="WALLE, DEX, or Tie")
+        accuracy_leader: str = Field(..., description="WALLE, DEX, or Equal")
+        actionability_leader: str = Field(..., description="WALLE, DEX, or Equal")
+        dimension_largest_gap: str = Field(..., description="D1, D2, ... D7, or None")
+        one_sentence_summary: str = Field(..., description="Single incident only")
+
     class JudgeOut(BaseModel):
-        winner_overall: str = Field(...)
-        winner_correctness: str = Field(...)
-        winner_specificity: str = Field(...)
-        winner_actionability: str = Field(...)
-        confidence: float = Field(...)
-        reason: str = Field(...)
+        walle: ModelEvalScores
+        dex: ModelEvalScores
+        walle_summary: ModelSummary
+        dex_summary: ModelSummary
+        verdict: VerdictOut
 
     deployment = (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip()
     if not deployment:
@@ -334,7 +780,7 @@ def _judge_with_pydantic_ai(
         extra_headers["projectId"] = project_id
 
     settings = OpenAIChatModelSettings(extra_headers=extra_headers) if extra_headers else OpenAIChatModelSettings()
-    agent = Agent(model, output_type=JudgeOut, model_settings=settings, system_prompt=system_prompt)
+    agent = Agent(model, output_type=JudgeOut, model_settings=settings, system_prompt=_LLM_JUDGE_SYSTEM)
 
     async def _run() -> JudgeOut:
         res = await agent.run(user_prompt)
@@ -859,7 +1305,7 @@ def main() -> int:
     metric_5_pairs = pd.DataFrame(m5_pair_rows)
 
     # ---- Metric 6: LLM-as-judge (optional) ----
-    # Blind A/B evaluation of DEX vs WALLE using incident text, without exposing which system is which.
+    # Full rubric: WALLE vs DEX on 7 dimensions + summaries + verdict (see _llm_judge_user_prompt).
     metric_6_rows = pd.DataFrame([])
     metric_6_summary = pd.DataFrame([])
     llm_lines: list[str] = []
@@ -869,7 +1315,6 @@ def main() -> int:
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
         api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
         deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", os.getenv("AZURE_OPENAI_DEPLOYMENT", "")).strip()
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", os.getenv("OPENAI_API_VERSION", "")).strip() or "2024-02-15-preview"
 
         if not (endpoint and api_key and deployment):
             reason = "missing one of AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT_NAME"
@@ -888,7 +1333,6 @@ def main() -> int:
             )
             metric_6_summary = pd.DataFrame([{"status": "skipped", "reason": reason}])
         else:
-            rng = random.Random(int(args.llm_judge_seed))
             n_default = 200
             judge_n = int(args.llm_judge_n) if int(args.llm_judge_n) > 0 else n_default
             judge_n = min(judge_n, len(df_view))
@@ -913,30 +1357,13 @@ def main() -> int:
                 s = ILLEGAL_CHARACTERS_RE.sub("", s)
                 return s.strip()
 
+            colset = set(candidates.columns)
             judge_out: list[dict] = []
             failures = 0
             last_call_ts: float | None = None
             for idx, row in candidates.iterrows():
                 inc_id = _safe_txt(row.get("INC_ID"))
-                # Build incident context
-                context_parts = []
-                for c in [
-                    "INC_BRIEF_DESCRIPTION",
-                    "INC_ACTION",
-                    "INC_RESOLUTION",
-                    "INC_UPDATE_ACTION_ESS",
-                    "INC_UH_ESS_ERRORMSG",
-                    "INC_UPDATE_ACTION",
-                    "INC_COMMENTS",
-                    "INC_UH_MONITORING_NOTES",
-                ]:
-                    if c in candidates.columns:
-                        val = _safe_txt(row.get(c))
-                        if val:
-                            context_parts.append(f"{c}: {val}")
-                context = "\n".join(context_parts)
-                context = context[: int(args.llm_judge_max_context_chars)]
-
+                incident_fields = _build_llm_judge_incident_fields(row, safe_txt=_safe_txt, columns=colset)
                 dex = {
                     "L1": _safe_txt(row.get("DEX_L1")),
                     "L2": _safe_txt(row.get("DEX_L2")),
@@ -950,51 +1377,11 @@ def main() -> int:
                     "L4": _safe_txt(row.get("WALLE_L4")),
                 }
 
-                # Randomly assign A/B to avoid position bias.
-                if rng.random() < 0.5:
-                    a_name, b_name = "DEX", "WALLE"
-                    a_labels, b_labels = dex, wal
-                else:
-                    a_name, b_name = "WALLE", "DEX"
-                    a_labels, b_labels = wal, dex
+                user = _llm_judge_user_prompt(incident=incident_fields, walle=wal, dex=dex)
+                max_ctx = int(args.llm_judge_max_context_chars)
+                if max_ctx > 0 and len(user) > max_ctx:
+                    user = user[:max_ctx] + "\n\n[TRUNCATED: user prompt exceeded --llm-judge-max-context-chars]"
 
-                system = (
-                    "You are a strict evaluator of incident classification labels. "
-                    "You will be given incident text and two candidate label sets (A and B). "
-                    "Do not assume either system is better; evaluate only from the provided text."
-                )
-                user = f"""Evaluate which candidate label set is better.
-
-Incident text (may be noisy/incomplete):
-{context}
-
-Candidate A labels:
-L1={a_labels.get('L1')}
-L2={a_labels.get('L2')}
-L3={a_labels.get('L3')}
-L4={a_labels.get('L4')}
-
-Candidate B labels:
-L1={b_labels.get('L1')}
-L2={b_labels.get('L2')}
-L3={b_labels.get('L3')}
-L4={b_labels.get('L4')}
-
-Scoring rubric (choose winners independently):
-- correctness: which set best matches the incident text?
-- specificity: which set is more specific without hallucinating?
-- actionability: which set better supports taking an action / routing?
-
-Return ONLY valid JSON with this schema:
-{{
-  "winner_overall": "A" | "B" | "tie",
-  "winner_correctness": "A" | "B" | "tie",
-  "winner_specificity": "A" | "B" | "tie",
-  "winner_actionability": "A" | "B" | "tie",
-  "confidence": 0.0-1.0,
-  "reason": "1-3 sentences, neutral and specific"
-}}
-"""
                 # Proactive throttle to avoid RPM limit (sequential judge calls).
                 last_call_ts = _maybe_sleep_for_rpm(last_call_ts, int(args.llm_judge_max_rpm))
 
@@ -1003,26 +1390,8 @@ Return ONLY valid JSON with this schema:
                     try:
                         # IDENTICAL to L4 approach: pydantic-ai Agent + OpenAIChatModel(provider="azure")
                         # with gateway headers via OpenAIChatModelSettings. No REST fallback.
-                        obj = _judge_with_pydantic_ai(system_prompt=system, user_prompt=user)
-                        rec = {
-                            "INC_ID": inc_id,
-                            "a_system": a_name,
-                            "b_system": b_name,
-                            "a_L1": a_labels.get("L1"),
-                            "a_L2": a_labels.get("L2"),
-                            "a_L3": a_labels.get("L3"),
-                            "a_L4": a_labels.get("L4"),
-                            "b_L1": b_labels.get("L1"),
-                            "b_L2": b_labels.get("L2"),
-                            "b_L3": b_labels.get("L3"),
-                            "b_L4": b_labels.get("L4"),
-                            "winner_overall": obj.get("winner_overall"),
-                            "winner_correctness": obj.get("winner_correctness"),
-                            "winner_specificity": obj.get("winner_specificity"),
-                            "winner_actionability": obj.get("winner_actionability"),
-                            "confidence": obj.get("confidence"),
-                            "reason": obj.get("reason"),
-                        }
+                        obj = _judge_with_pydantic_ai(user_prompt=user)
+                        rec = _flatten_judge_out_for_excel(inc_id, wal, dex, obj)
                         judge_out.append(rec)
                         break
                     except Exception as e:
@@ -1050,38 +1419,94 @@ Return ONLY valid JSON with this schema:
             total_judged = int(len(metric_6_rows))
             llm_lines.append(f"- Judged rows: {total_judged} (failures: {failures}).")
 
-            # Aggregate win rates for WALLE across rubrics.
-            def _winner_to_system(row_val: str, a_system: str, b_system: str) -> str:
-                if row_val == "A":
-                    return a_system
-                if row_val == "B":
-                    return b_system
-                if row_val == "tie":
-                    return "tie"
-                return "invalid"
-
+            # Aggregate verdicts and mean reported averages (successful rows only).
             summary_rows: list[dict] = []
-            for field in ["winner_overall", "winner_correctness", "winner_specificity", "winner_actionability"]:
-                if field not in metric_6_rows.columns:
-                    continue
-                if "a_system" not in metric_6_rows.columns or "b_system" not in metric_6_rows.columns:
-                    continue
-                winners = metric_6_rows.apply(
-                    lambda r: _winner_to_system(str(r.get(field)), str(r.get("a_system")), str(r.get("b_system"))),
-                    axis=1,
-                )
-                denom = int((winners != "invalid").sum())
-                if denom == 0:
-                    continue
+            ok = metric_6_rows
+            if "error" in ok.columns:
+                ok = ok[ok["error"].isna()]
+            if "verdict_overall" in ok.columns:
+                ok = ok[ok["verdict_overall"].notna()]
+
+            n_ok = int(len(ok))
+            if n_ok > 0:
+
+                def _norm_v(s: str) -> str:
+                    t = str(s).strip().upper()
+                    if t in ("TIE",):
+                        return "Tie"
+                    if "WALLE" in t or t == "WALL-E":
+                        return "WALLE"
+                    if "DEX" in t:
+                        return "DEX"
+                    return t
+
+                vo = ok["verdict_overall"].map(_norm_v)
                 summary_rows.append(
                     {
-                        "metric": field,
-                        "rows": denom,
-                        "walle_win_pct": float((winners == "WALLE").mean() * 100.0),
-                        "dex_win_pct": float((winners == "DEX").mean() * 100.0),
-                        "tie_pct": float((winners == "tie").mean() * 100.0),
+                        "metric": "verdict_overall",
+                        "rows": n_ok,
+                        "WALLE_pct": float((vo == "WALLE").sum() / n_ok * 100.0),
+                        "DEX_pct": float((vo == "DEX").sum() / n_ok * 100.0),
+                        "Tie_pct": float((vo == "Tie").sum() / n_ok * 100.0),
                     }
                 )
+                if "verdict_accuracy_leader" in ok.columns:
+                    va = ok["verdict_accuracy_leader"].map(_norm_v)
+                    summary_rows.append(
+                        {
+                            "metric": "verdict_accuracy_leader",
+                            "rows": n_ok,
+                            "WALLE_pct": float((va == "WALLE").sum() / n_ok * 100.0),
+                            "DEX_pct": float((va == "DEX").sum() / n_ok * 100.0),
+                            "Equal_pct": float((va == "EQUAL").sum() / n_ok * 100.0),
+                        }
+                    )
+                if "verdict_actionability_leader" in ok.columns:
+                    vb = ok["verdict_actionability_leader"].map(_norm_v)
+                    summary_rows.append(
+                        {
+                            "metric": "verdict_actionability_leader",
+                            "rows": n_ok,
+                            "WALLE_pct": float((vb == "WALLE").sum() / n_ok * 100.0),
+                            "DEX_pct": float((vb == "DEX").sum() / n_ok * 100.0),
+                            "Equal_pct": float((vb == "EQUAL").sum() / n_ok * 100.0),
+                        }
+                    )
+                for col_avg, label in [
+                    ("walle_overall_avg", "mean_walle_overall_avg"),
+                    ("dex_overall_avg", "mean_dex_overall_avg"),
+                    ("walle_section1_avg", "mean_walle_section1_avg"),
+                    ("dex_section1_avg", "mean_dex_section1_avg"),
+                    ("walle_section2_avg", "mean_walle_section2_avg"),
+                    ("dex_section2_avg", "mean_dex_section2_avg"),
+                ]:
+                    if col_avg in ok.columns:
+                        s = pd.to_numeric(ok[col_avg], errors="coerce")
+                        if s.notna().any():
+                            summary_rows.append({"metric": label, "rows": int(s.notna().sum()), "mean": float(s.mean())})
+                if "walle_overall_avg" in ok.columns and "dex_overall_avg" in ok.columns:
+                    w = pd.to_numeric(ok["walle_overall_avg"], errors="coerce")
+                    d = pd.to_numeric(ok["dex_overall_avg"], errors="coerce")
+                    m = (w - d).dropna()
+                    if not m.empty:
+                        summary_rows.append(
+                            {
+                                "metric": "mean_walle_minus_dex_overall_avg",
+                                "rows": int(len(m)),
+                                "mean": float(m.mean()),
+                            }
+                        )
+                if "verdict_dimension_largest_gap" in ok.columns:
+                    vc = ok["verdict_dimension_largest_gap"].astype(str).value_counts().head(5)
+                    for gap, cnt in vc.items():
+                        summary_rows.append(
+                            {
+                                "metric": "verdict_dimension_largest_gap_top",
+                                "dimension": gap,
+                                "count": int(cnt),
+                                "pct_of_rows": float(cnt / n_ok * 100.0),
+                            }
+                        )
             metric_6_summary = pd.DataFrame(summary_rows)
     else:
         # If the flag wasn't enabled, still leave a visible marker row in the sheets.
@@ -1274,19 +1699,20 @@ Return ONLY valid JSON with this schema:
         ],
         "metric_6_llm_judge_rows": [
             "METRIC 6: LLM-AS-JUDGE (ROW-LEVEL) (metric_6_llm_judge_rows)",
-            "- Meaning: A blind A/B judge compares DEX vs WALLE labels using incident text; A/B is randomized per row to reduce bias.",
-            "- Columns include which system was A/B, which won on overall/correctness/specificity/actionability, plus confidence and a short reason.",
+            "- Meaning: Full rubric — WALLE vs DEX on 7 scored dimensions (D1-D7), per-model section averages, and verdict (single incident only).",
+            "- Incident text: INC_BRIEF_DESCRIPTION (+ error msg), long description bundle (ACTION/COMMENTS/UPDATE_ACTION), RESOLUTION, work notes (COMMENTS/MONITORING), steps (UPDATE_ACTION_ESS/UPDATE_ACTION). KB fields: not in extract → judge marks D3 as N.",
+            "- Columns: WALLE_/DEX_ L1-L4 inputs; walle_D1..D7_score/reasoning (+ D5/D6 examples); walle_/dex_ summary averages; verdict_* fields.",
             "INFERENCES FROM THIS RUN",
             *(llm_lines if llm_lines else ["- (LLM judge not run; enable with --llm-judge and set Azure OpenAI env vars)"]),
             "PITFALLS",
-            "- This is a model-based proxy judge, not ground truth. Use as directional signal and validate with human review.",
+            "- Model-based proxy judge, not ground truth. Verdict applies to this row only; roll up conclusions manually across incidents.",
         ],
         "metric_6_llm_judge_summary": [
             "METRIC 6: LLM-AS-JUDGE (SUMMARY) (metric_6_llm_judge_summary)",
-            "- Meaning: aggregate win/tie rates for WALLE vs DEX across the judging rubrics.",
-            "- walle_win_pct is the % of judged rows where the judge chose WALLE for that rubric.",
+            "- Meaning: Across successful judge rows — distribution of verdict_overall (WALLE/DEX/Tie); accuracy_leader and actionability_leader; mean reported overall/section averages.",
+            "- Rows use metric column plus counts/pcts or mean as applicable.",
             "PITFALLS",
-            "- Win rates depend heavily on the judge prompt + sample selection; keep settings consistent between runs.",
+            "- Averages are as reported by the judge in structured output; validate sampling and prompt version across runs.",
         ],
     }
 
