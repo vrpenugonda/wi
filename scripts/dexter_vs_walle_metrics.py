@@ -2459,6 +2459,8 @@ def main() -> int:
             "PITFALLS",
             "- Model-based proxy judge, not ground truth. Verdict applies to this row only; roll up conclusions manually across incidents.",
             "- If many rows have 'error' populated, reduce llm_judge_workers and/or judge_n; transient 429/5xx are retried but persistent errors will remain.",
+            "PROMPT USED",
+            "- Uses the full WALLE vs DEX 7-dimension rubric prompt defined in `_llm_judge_user_prompt(...)` in this script.",
         ],
         "metric_6_llm_judge_summary": [
             "METRIC 6: LLM-AS-JUDGE (SUMMARY) (metric_6_llm_judge_summary)",
@@ -2476,18 +2478,34 @@ def main() -> int:
         "metric_A_path_consistency": [
             "METRIC A: PATH CONSISTENCY (metric_A_path_consistency)",
             "- LLM scores structural coherence of the 4-level path (not correctness).",
+            "PROMPT USED (exact logic; {path} substituted per row)",
+            "- You are evaluating an IT incident classification path for internal coherence. Score only structural consistency — not whether the classification is correct.",
+            "- Score: l1l2, l2l3, l3l4, overall (0-3). Return JSON with weakest transition and one-sentence reason.",
+            "HOW TO INFER OUTCOMES",
+            "- Higher mean_overall (closer to 3) => paths are more internally coherent.",
+            "- Higher pct_has_contradiction (any score=0) => taxonomy levels contradict each other more often (bad).",
         ],
         "metric_A_path_consistency_summary": [
             "METRIC A (SUMMARY): PATH CONSISTENCY SUMMARY (metric_A_path_consistency_summary)",
             "- Two rows: WALLE and DEX aggregate means and weakest-link stats.",
+            "HOW TO INFER OUTCOMES",
+            "- If WALLE mean_overall > DEX mean_overall, WALLE paths are structurally more coherent on average (per this judge).",
+            "- most_common_weakest tells you which transition (L1→L2 vs L2→L3 vs L3→L4) is breaking most often.",
         ],
         "metric_B_path_automation": [
             "METRIC B: PATH AUTOMATION (metric_B_path_automation)",
             "- LLM scores action/system/routing specificity (0-6 composite).",
+            "PROMPT USED (exact logic; {path} substituted per row)",
+            "- Scores ACTION SPECIFICITY (0-2), SYSTEM SPECIFICITY (0-2), ROUTING UNIQUENESS (0-2), plus composite=sum and automation_action.",
+            "HOW TO INFER OUTCOMES",
+            "- Higher mean_composite and higher pct_high (>=5) => paths are more usable for automation/routing.",
+            "- If action mean is low but system is high, the model names products but not what to do; if routing is low, labels are too broad for team/script selection.",
         ],
         "metric_B_path_automation_summary": [
             "METRIC B (SUMMARY): PATH AUTOMATION SUMMARY (metric_B_path_automation_summary)",
             "- Two rows: WALLE and DEX with composite distributions and dimension means.",
+            "HOW TO INFER OUTCOMES",
+            "- Compare mean_action/mean_system/mean_routing to see what drives composite differences.",
         ],
         "metric_C_mbo_clusters": [
             "METRIC C: MBO CLUSTERS (metric_C_mbo_clusters)",
@@ -2512,6 +2530,10 @@ def main() -> int:
         "metric_G_mbo_cluster_report": [
             "METRIC G: MBO CLUSTER REPORT (metric_G_mbo_cluster_report)",
             "- Top 20 mbo_viable clusters per model with rule-based intervention_type + LLM plan.",
+            "PROMPT USED (per cluster)",
+            "- Inputs: path, cluster count + pct_of_total, preliminary intervention_type. Output JSON: intervention, owning_team, success_metric.",
+            "HOW TO INFER OUTCOMES",
+            "- Prefer clusters with high incident_count/pct_of_total AND decent mean_path_consistency_score + mean_automation_score: these are high-leverage and well-defined targets.",
         ],
     }
 
