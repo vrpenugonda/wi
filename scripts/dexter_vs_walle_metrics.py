@@ -106,7 +106,14 @@ def _build_path(l1, l2, l3, l4, generic: set[str]) -> str | None:
 
 
 def _path_res_sim(path: str | None, text: str | None) -> float | None:
-    if not path or not text:
+    # sklearn vectorizers require real strings; NaN/None will raise.
+    if path is None or pd.isna(path):
+        return None
+    if text is None or pd.isna(text):
+        return None
+    path = str(path).strip()
+    text = str(text).strip()
+    if path == "" or text == "":
         return None
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
