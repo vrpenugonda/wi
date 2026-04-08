@@ -338,7 +338,12 @@ def _judge_with_pydantic_ai(
 
     async def _run() -> JudgeOut:
         res = await agent.run(user_prompt)
-        return res.data
+        # pydantic-ai versions differ: some expose `.data`, others `.output`.
+        if hasattr(res, "data"):
+            return res.data  # type: ignore[return-value]
+        if hasattr(res, "output"):
+            return res.output  # type: ignore[return-value]
+        raise RuntimeError(f"Unexpected AgentRunResult shape: {type(res)}")
 
     out = asyncio.run(_run())
     return out.model_dump()
