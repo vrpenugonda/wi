@@ -68,10 +68,15 @@ on:
         type: number
         default: 200
       llm_judge_seed:
-        description: "Random seed for judge A/B assignment + sampling (default: 7)"
+        description: "Random seed for judge row sampling (default: 7)"
         required: false
         type: number
         default: 7
+      llm_judge_workers:
+        description: "Concurrent LLM judge tasks (default: 5). Lower if you hit 429s; use 1 for sequential."
+        required: false
+        type: number
+        default: 5
       llm_judge_max_rpm:
         description: "Max LLM judge requests per minute (default: 30). Lower if you hit 429s."
         required: false
@@ -259,6 +264,7 @@ jobs:
           ARGS=(--in "$SAMPLE_PATH" --out "data/output/${{ inputs.report_name }}")
           if [[ "${{ inputs.llm_judge }}" == "true" ]]; then
             ARGS+=(--llm-judge --llm-judge-n "${{ inputs.llm_judge_n }}" --llm-judge-seed "${{ inputs.llm_judge_seed }}")
+            ARGS+=(--llm-judge-workers "${{ inputs.llm_judge_workers }}")
             ARGS+=(--llm-judge-max-rpm "${{ inputs.llm_judge_max_rpm }}")
           fi
 
