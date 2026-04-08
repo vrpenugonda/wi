@@ -91,6 +91,55 @@ def _to_month_bucket(s: pd.Series) -> pd.Series:
     return out.fillna("")
 
 
+def _build_path(l1, l2, l3, l4, generic: set[str]) -> str | None:
+    parts: list[str] = []
+    for x in (l1, l2, l3, l4):
+        if x is None or pd.isna(x):
+            continue
+        s = str(x).strip()
+        if s == "":
+            continue
+        if s.lower() in generic:
+            continue
+        parts.append(s)
+    return " → ".join(parts) if parts else None
+
+
+def _path_res_sim(path: str | None, text: str | None) -> float | None:
+    if not path or not text:
+        return None
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+    except Exception:
+        return None
+    v = TfidfVectorizer().fit([path, text])
+    m = v.transform([path, text])
+    return float(cosine_similarity(m[0], m[1])[0][0])
+
+
+def _append_blocks_after_write(xlsx_path: Path, blocks: dict[str, list[dict]]) -> None:
+    """
+    Append summary blocks after the data table in a sheet.
+    blocks[sheet] = [{"title": str, "headers": [...], "rows": [[...], ...]}, ...]
+    """
+    wb = load_workbook(xlsx_path)
+    for sheet, blks in blocks.items():
+        if sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+        for b in blks:
+            ws.append([])
+            title = b.get("title")
+            if title:
+                ws.append([title])
+            headers = b.get("headers") or []
+            if headers:
+                ws.append(list(headers))
+            for r in b.get("rows") or []:
+                ws.append(list(r))
+    wb.save(xlsx_path)
+
 def _is_trueish(v) -> bool:
     if v is None or pd.isna(v):
         return False
@@ -1074,6 +1123,16 @@ def main() -> int:
             lambda x: ILLEGAL_CHARACTERS_RE.sub("", x) if isinstance(x, str) else x
         )
 
+    # ---- Shared setup for additional metrics (A–G): full 4-level paths ----
+    df_view["walle_path"] = df_view.apply(
+        lambda r: _build_path(r.get("WALLE_L1"), r.get("WALLE_L2"), r.get("WALLE_L3"), r.get("WALLE_L4"), generic),
+        axis=1,
+    )
+    df_view["dex_path"] = df_view.apply(
+        lambda r: _build_path(r.get("DEX_L1"), r.get("DEX_L2"), r.get("DEX_L3"), r.get("DEX_L4"), generic),
+        axis=1,
+    )
+
     # ---- Metric 1: coverage ----
     rows = len(df_view)
     out_rows: list[dict] = []
@@ -1666,6 +1725,548 @@ def main() -> int:
         except Exception:
             pass
 
+    # =====================================================================
+    # Additional metrics (A–G) on full 4-level paths (walle_path/dex_path)
+    # Run order: C → D → F → E → A → B → G
+    # =====================================================================
+
+    blocks_to_append: dict[str, list[dict]] = {}
+
+    # ---- Metric C: MBO clusters ----
+    CATCH_ALL_L3 = [
+        "Error / Failure",
+        "Other",
+        "Unknown",
+        "Error",
+        "General",
+        "Application/Service",
+        "Desktop Related",
+        "Other RFI",
+    ]
+
+    def _metric_c_for(model: str) -> pd.DataFrame:
+        if model == "WALLE":
+            path_col = "walle_path"
+            l1, l2, l3, l4 = "WALLE_L1", "WALLE_L2", "WALLE_L3", "WALLE_L4"
+        else:
+            path_col = "dex_path"
+            l1, l2, l3, l4 = "DEX_L1", "DEX_L2", "DEX_L3", "DEX_L4"
+        base = df_view[[path_col, l1, l2, l3, l4]].copy()
+        base = base[base[path_col].notna()]
+        total = int(len(base))
+        if total == 0:
+            return pd.DataFrame([])
+        g = (
+            base.groupby([path_col, l1, l2, l3, l4], dropna=False)
+            .size()
+            .reset_index(name="incident_count")
+            .sort_values("incident_count", ascending=False)
+            .reset_index(drop=True)
+        )
+        g["model"] = model
+        g["rank_by_volume"] = (g.index + 1).astype(int)
+        g["full_path"] = g[path_col]
+        g["l1_domain"] = g[l1]
+        g["l2_category"] = g[l2]
+        g["l3_subcategory"] = g[l3]
+        g["l4_key_issue"] = g[l4]
+        g["pct_of_total"] = g["incident_count"] / float(total) * 100.0
+        g["cumulative_pct"] = g["pct_of_total"].cumsum()
+        g["catch_all_flag"] = g["l3_subcategory"].astype(str).isin(CATCH_ALL_L3)
+        g["mbo_viable"] = (g["incident_count"] >= 3) & (~g["catch_all_flag"]) & g["l4_key_issue"].apply(lambda v: _is_usable_label(v, generic))
+        return g[
+            [
+                "model",
+                "rank_by_volume",
+                "full_path",
+                "l1_domain",
+                "l2_category",
+                "l3_subcategory",
+                "l4_key_issue",
+                "incident_count",
+                "pct_of_total",
+                "cumulative_pct",
+                "catch_all_flag",
+                "mbo_viable",
+            ]
+        ]
+
+    metric_C = pd.concat([_metric_c_for("WALLE"), _metric_c_for("DEX")], ignore_index=True)
+
+    def _pareto_summary(df_model: pd.DataFrame) -> dict[str, Any]:
+        if df_model.empty:
+            return {
+                "total_incidents": 0,
+                "unique_paths": 0,
+                "paths_to_cover_50pct": None,
+                "paths_to_cover_80pct": None,
+                "pct_incidents_in_viable_clusters": None,
+                "pct_incidents_in_catch_all": None,
+                "largest_cluster_path": None,
+                "largest_cluster_pct": None,
+            }
+        total_incidents = int(df_model["incident_count"].sum())
+        unique_paths = int(df_model["full_path"].nunique())
+        paths_50 = int((df_model["cumulative_pct"] <= 50.0).sum()) + 1
+        paths_80 = int((df_model["cumulative_pct"] <= 80.0).sum()) + 1
+        pct_viable = float(df_model.loc[df_model["mbo_viable"], "incident_count"].sum() / total_incidents * 100.0) if total_incidents else None
+        pct_catch = float(df_model.loc[df_model["catch_all_flag"], "incident_count"].sum() / total_incidents * 100.0) if total_incidents else None
+        largest = df_model.head(1)
+        return {
+            "total_incidents": total_incidents,
+            "unique_paths": unique_paths,
+            "paths_to_cover_50pct": paths_50,
+            "paths_to_cover_80pct": paths_80,
+            "pct_incidents_in_viable_clusters": pct_viable,
+            "pct_incidents_in_catch_all": pct_catch,
+            "largest_cluster_path": str(largest["full_path"].iloc[0]) if not largest.empty else None,
+            "largest_cluster_pct": float(largest["pct_of_total"].iloc[0]) if not largest.empty else None,
+        }
+
+    if not metric_C.empty:
+        wsum = _pareto_summary(metric_C[metric_C["model"] == "WALLE"])
+        dsum = _pareto_summary(metric_C[metric_C["model"] == "DEX"])
+        blocks_to_append["metric_C_mbo_clusters"] = [
+            {
+                "title": "Pareto summary (label | WALLE value | DEX value)",
+                "headers": ["label", "WALLE", "DEX"],
+                "rows": [
+                    ["total_incidents", wsum["total_incidents"], dsum["total_incidents"]],
+                    ["unique_paths", wsum["unique_paths"], dsum["unique_paths"]],
+                    ["paths_to_cover_50pct", wsum["paths_to_cover_50pct"], dsum["paths_to_cover_50pct"]],
+                    ["paths_to_cover_80pct", wsum["paths_to_cover_80pct"], dsum["paths_to_cover_80pct"]],
+                    ["pct_incidents_in_viable_clusters", wsum["pct_incidents_in_viable_clusters"], dsum["pct_incidents_in_viable_clusters"]],
+                    ["pct_incidents_in_catch_all", wsum["pct_incidents_in_catch_all"], dsum["pct_incidents_in_catch_all"]],
+                    ["largest_cluster_path", wsum["largest_cluster_path"], dsum["largest_cluster_path"]],
+                    ["largest_cluster_pct", wsum["largest_cluster_pct"], dsum["largest_cluster_pct"]],
+                ],
+            }
+        ]
+
+    # ---- Metric D: path stability (TF-IDF similar pairs) ----
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        texts = df_view.get("INC_BRIEF_DESCRIPTION", pd.Series([""] * len(df_view))).fillna("").astype(str).tolist()
+        tfidf = TfidfVectorizer(max_features=300, stop_words="english")
+        mat = tfidf.fit_transform(texts)
+        sim = cosine_similarity(mat)
+        THRESHOLD = 0.35
+        d_rows: list[dict] = []
+        n = len(df_view)
+        for i in range(n):
+            for j in range(i + 1, n):
+                s = float(sim[i, j])
+                if s >= THRESHOLD:
+                    d_rows.append(
+                        {
+                            "inc_id_a": df_view["INC_ID"].iloc[i],
+                            "inc_id_b": df_view["INC_ID"].iloc[j],
+                            "text_similarity": s,
+                            "walle_path_a": df_view["walle_path"].iloc[i],
+                            "walle_path_b": df_view["walle_path"].iloc[j],
+                            "walle_path_match": str(df_view["walle_path"].iloc[i]) == str(df_view["walle_path"].iloc[j]),
+                            "walle_l1_match": str(df_view.get("WALLE_L1", pd.Series([""])).iloc[i]) == str(df_view.get("WALLE_L1", pd.Series([""])).iloc[j]),
+                            "dex_path_a": df_view["dex_path"].iloc[i],
+                            "dex_path_b": df_view["dex_path"].iloc[j],
+                            "dex_path_match": str(df_view["dex_path"].iloc[i]) == str(df_view["dex_path"].iloc[j]),
+                            "dex_l1_match": str(df_view.get("DEX_L1", pd.Series([""])).iloc[i]) == str(df_view.get("DEX_L1", pd.Series([""])).iloc[j]),
+                        }
+                    )
+        metric_D = pd.DataFrame(d_rows)
+        total_pairs = int(len(metric_D))
+        blocks_to_append["metric_D_path_stability"] = [
+            {
+                "title": "Summary (model | total_similar_pairs | pct_full_path_match | pct_l1_match | threshold_used)",
+                "headers": ["model", "total_similar_pairs", "pct_full_path_match", "pct_l1_match", "threshold_used"],
+                "rows": [
+                    ["WALLE", total_pairs, float(metric_D["walle_path_match"].mean() * 100.0) if total_pairs else None, float(metric_D["walle_l1_match"].mean() * 100.0) if total_pairs else None, THRESHOLD],
+                    ["DEX", total_pairs, float(metric_D["dex_path_match"].mean() * 100.0) if total_pairs else None, float(metric_D["dex_l1_match"].mean() * 100.0) if total_pairs else None, THRESHOLD],
+                ],
+            }
+        ]
+    except Exception as e:
+        metric_D = pd.DataFrame([{"status": "skipped_missing_dependency_or_error", "reason": str(e)[:300]}])
+
+    # ---- Metric F: resolution coherence ----
+    f_rows: list[dict] = []
+    for r in df_view.itertuples(index=False):
+        inc_id = getattr(r, "INC_ID", None)
+        wpath = getattr(r, "walle_path", None)
+        dpath = getattr(r, "dex_path", None)
+        res = getattr(r, "INC_RESOLUTION", None) if "INC_RESOLUTION" in df_view.columns else None
+        work = getattr(r, "INC_COMMENTS", None) if "INC_COMMENTS" in df_view.columns else None
+
+        w_full = _path_res_sim(wpath, res)
+        d_full = _path_res_sim(dpath, res)
+        w_l1l2 = _path_res_sim(_build_path(getattr(r, "WALLE_L1", None), getattr(r, "WALLE_L2", None), None, None, generic), res)
+        d_l1l2 = _path_res_sim(_build_path(getattr(r, "DEX_L1", None), getattr(r, "DEX_L2", None), None, None, generic), res)
+        w_work = _path_res_sim(wpath, work)
+        d_work = _path_res_sim(dpath, work)
+
+        def _winner(a, b) -> str:
+            if a is None or b is None:
+                return "Tie"
+            if a > b + 0.05:
+                return "WALLE"
+            if b > a + 0.05:
+                return "DEX"
+            return "Tie"
+
+        f_rows.append(
+            {
+                "INC_ID": inc_id,
+                "walle_path": wpath,
+                "dex_path": dpath,
+                "walle_full_sim": w_full,
+                "dex_full_sim": d_full,
+                "walle_l1l2_sim": w_l1l2,
+                "dex_l1l2_sim": d_l1l2,
+                "walle_worknotes_sim": w_work,
+                "dex_worknotes_sim": d_work,
+                "resolution_available": bool(res) and str(res).strip() != "",
+                "full_sim_winner": _winner(w_full, d_full),
+                "l1l2_sim_winner": _winner(w_l1l2, d_l1l2),
+            }
+        )
+    metric_F = pd.DataFrame(f_rows)
+    scoreable = metric_F[metric_F["resolution_available"] == True]  # noqa: E712
+    metric_F_summary = pd.DataFrame(
+        [
+            {
+                "model": "WALLE",
+                "scoreable_rows": int(len(scoreable)),
+                "mean_full_sim": float(pd.to_numeric(scoreable["walle_full_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "mean_l1l2_sim": float(pd.to_numeric(scoreable["walle_l1l2_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "mean_worknotes_sim": float(pd.to_numeric(scoreable["walle_worknotes_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "pct_winner_full": float((scoreable["full_sim_winner"] == "WALLE").mean() * 100.0) if len(scoreable) else None,
+                "pct_winner_l1l2": float((scoreable["l1l2_sim_winner"] == "WALLE").mean() * 100.0) if len(scoreable) else None,
+            },
+            {
+                "model": "DEX",
+                "scoreable_rows": int(len(scoreable)),
+                "mean_full_sim": float(pd.to_numeric(scoreable["dex_full_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "mean_l1l2_sim": float(pd.to_numeric(scoreable["dex_l1l2_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "mean_worknotes_sim": float(pd.to_numeric(scoreable["dex_worknotes_sim"], errors="coerce").mean()) if len(scoreable) else None,
+                "pct_winner_full": float((scoreable["full_sim_winner"] == "DEX").mean() * 100.0) if len(scoreable) else None,
+                "pct_winner_l1l2": float((scoreable["l1l2_sim_winner"] == "DEX").mean() * 100.0) if len(scoreable) else None,
+            },
+        ]
+    )
+
+    # ---- Metric E: confidence calibration (WALLE only; requires Metric 6 outputs) ----
+    try:
+        from scipy.stats import pearsonr
+
+        conf_col = "WALLE_AI_L4_CONFIDENCE" if "WALLE_AI_L4_CONFIDENCE" in df_view.columns else None
+        actionable_col = "WALLE_L4_ACTIONABLE" if "WALLE_L4_ACTIONABLE" in df_view.columns else None
+        if conf_col is None:
+            metric_E = pd.DataFrame([{"status": "skipped", "reason": "WALLE_AI_L4_CONFIDENCE not present in data sheet"}])
+        else:
+            j = metric_6_rows.copy()
+            if "error" in j.columns:
+                j = j[j["error"].isna()]
+            keep = [c for c in ["INC_ID", "walle_overall_avg", "walle_section1_avg", "walle_section2_avg"] if c in j.columns]
+            j = j[keep]
+            m = df_view[["INC_ID", "walle_path", conf_col] + ([actionable_col] if actionable_col else [])].merge(j, on="INC_ID", how="inner")
+            m["walle_confidence"] = pd.to_numeric(m[conf_col], errors="coerce")
+            m["walle_judge_overall"] = pd.to_numeric(m.get("walle_overall_avg"), errors="coerce")
+            m["walle_judge_section1"] = pd.to_numeric(m.get("walle_section1_avg"), errors="coerce")
+            m["walle_judge_section2"] = pd.to_numeric(m.get("walle_section2_avg"), errors="coerce")
+            m = m.dropna(subset=["walle_confidence", "walle_judge_overall"])
+            if m.empty:
+                metric_E = pd.DataFrame([{"status": "skipped", "reason": "No rows after join/dropna"}])
+            else:
+                r, pval = pearsonr(m["walle_confidence"], m["walle_judge_overall"])
+                is_calibrated = bool((r > 0.3) and (pval < 0.05))
+                bins = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+                labels = ["<0.50", "0.50-0.60", "0.60-0.70", "0.70-0.80", "0.80-0.90", "0.90-1.00"]
+                m["confidence_bin"] = pd.cut(m["walle_confidence"].clip(lower=0, upper=1.0), bins=bins, labels=labels, include_lowest=True)
+                metric_E = m.rename(columns={actionable_col: "walle_actionable_flag"} if actionable_col else {})[
+                    ["INC_ID", "walle_path", "walle_confidence"]
+                    + (["walle_actionable_flag"] if actionable_col else [])
+                    + ["walle_judge_overall", "walle_judge_section1", "walle_judge_section2", "confidence_bin"]
+                ]
+
+                blocks_to_append["metric_E_confidence_calibration"] = [
+                    {"title": "pearson_r | pearson_p | is_calibrated", "headers": ["pearson_r", "pearson_p", "is_calibrated"], "rows": [[float(r), float(pval), is_calibrated]]}
+                ]
+                if "walle_actionable_flag" in metric_E.columns:
+                    t = metric_E[metric_E["walle_actionable_flag"].apply(_is_trueish)]
+                    f = metric_E[~metric_E["walle_actionable_flag"].apply(_is_trueish)]
+                    mt = float(pd.to_numeric(t["walle_judge_overall"], errors="coerce").mean()) if not t.empty else None
+                    mf = float(pd.to_numeric(f["walle_judge_overall"], errors="coerce").mean()) if not f.empty else None
+                    valid = (mt is not None and mf is not None and abs(mt - mf) > 0.3)
+                    blocks_to_append["metric_E_confidence_calibration"].append(
+                        {"title": "Actionability", "headers": ["mean_judge_actionable_true", "mean_judge_actionable_false", "actionability_flag_valid"], "rows": [[mt, mf, bool(valid)]]}
+                    )
+                bstats = metric_E.groupby("confidence_bin", dropna=False)["walle_judge_overall"].agg(["count", "mean", "std"]).reset_index()
+                blocks_to_append["metric_E_confidence_calibration"].append(
+                    {
+                        "title": "Bin stats",
+                        "headers": ["confidence_bin", "count", "mean_judge_score", "std"],
+                        "rows": [[str(rec["confidence_bin"]), int(rec["count"]), float(rec["mean"]) if pd.notna(rec["mean"]) else None, float(rec["std"]) if pd.notna(rec["std"]) else None] for rec in bstats.to_dict(orient="records")],
+                    }
+                )
+    except Exception as e:
+        metric_E = pd.DataFrame([{"status": "skipped_missing_dependency_or_error", "reason": str(e)[:300]}])
+
+    # ---- Metric A/B/G: LLM-based (requires Azure env configured; reuse judge parallel patterns) ----
+    import os
+    azure_ready = bool(os.getenv("AZURE_OPENAI_API_KEY")) and bool(os.getenv("AZURE_OPENAI_ENDPOINT")) and bool(os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"))
+    if bool(args.llm_judge) and azure_ready:
+        # For brevity, reuse the existing judge agent stack via pydantic-ai Agents per metric.
+        from pydantic import BaseModel, Field
+        from pydantic_ai import Agent
+        from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+        import asyncio
+
+        deployment = (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or "").strip()
+        model = OpenAIChatModel(deployment, provider="azure")
+        x_upstream_env = (os.getenv("X_UPSTREAM_ENV") or os.getenv("X-Upstream-Env") or "").strip()
+        project_id = (os.getenv("PROJECT_ID") or os.getenv("projectId") or "").strip()
+        extra_headers: dict[str, str] = {}
+        if x_upstream_env:
+            extra_headers.update({"X-Upstream-Env": x_upstream_env, "projectId": project_id, "X-Model-Usage-Type": x_upstream_env, "modelUsageType": x_upstream_env})
+        elif project_id:
+            extra_headers["projectId"] = project_id
+        ms = OpenAIChatModelSettings(extra_headers=extra_headers) if extra_headers else OpenAIChatModelSettings()
+
+        # Metric A
+        class AOut(BaseModel):
+            l1l2: int = Field(..., ge=0, le=3)
+            l2l3: int = Field(..., ge=0, le=3)
+            l3l4: int = Field(..., ge=0, le=3)
+            overall: int = Field(..., ge=0, le=3)
+            weakest: str
+            reason: str
+
+        agentA = Agent(model, output_type=AOut, model_settings=ms)
+        promptA = (
+            "You are evaluating an IT incident classification path for internal coherence.\n"
+            "Score only structural consistency — not whether the classification is correct.\n\n"
+            "Path: {path}\n\n"
+            "Score each level transition (0=contradiction, 1=unrelated, 2=loosely consistent, 3=fully consistent):\n"
+            "  L1→L2: Does Category follow from Domain?\n"
+            "  L2→L3: Does Subcategory follow from Category?\n"
+            "  L3→L4: Does Key Issue follow from Subcategory?\n"
+            "  overall: Is this a coherent business address for one incident type?\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\"l1l2\":0-3,\"l2l3\":0-3,\"l3l4\":0-3,\"overall\":0-3,\n"
+            " \"weakest\":\"L1→L2|L2→L3|L3→L4|None\",\"reason\":\"one sentence\"}\n"
+        )
+        A_base = df_view[["INC_ID", "walle_path", "dex_path"]].copy()
+        A_base = A_base[(A_base["walle_path"].notna()) | (A_base["dex_path"].notna())].reset_index(drop=True)
+        pw = [promptA.format(path=p) for p in A_base["walle_path"].fillna("(none)").tolist()]
+        pdx = [promptA.format(path=p) for p in A_base["dex_path"].fillna("(none)").tolist()]
+        ow = asyncio.run(_run_agent_prompts_parallel(agent=agentA, prompts=pw, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_A_WALLE"))
+        od = asyncio.run(_run_agent_prompts_parallel(agent=agentA, prompts=pdx, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_A_DEX"))
+        A_rows: list[dict] = []
+        for i, rr in enumerate(A_base.itertuples(index=False)):
+            row = {"INC_ID": rr.INC_ID, "walle_path": rr.walle_path, "dex_path": rr.dex_path}
+            for obj, pref in [(ow[i], "walle"), (od[i], "dex")]:
+                if obj.get("error"):
+                    row[f"{pref}_error"] = obj.get("error")
+                else:
+                    row[f"{pref}_l1l2"] = obj.get("l1l2")
+                    row[f"{pref}_l2l3"] = obj.get("l2l3")
+                    row[f"{pref}_l3l4"] = obj.get("l3l4")
+                    row[f"{pref}_overall"] = obj.get("overall")
+                    row[f"{pref}_weakest"] = obj.get("weakest")
+                    row[f"{pref}_reason"] = obj.get("reason")
+            row["status"] = "success" if ("walle_error" not in row and "dex_error" not in row) else "llm_failed"
+            A_rows.append(row)
+        metric_A = pd.DataFrame(A_rows)
+        metric_A_summary = pd.DataFrame(
+            [
+                {
+                    "model": "WALLE",
+                    "mean_l1l2": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "walle_l1l2"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_l2l3": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "walle_l2l3"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_l3l4": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "walle_l3l4"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_overall": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "walle_overall"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "pct_score3": float((pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "walle_overall"], errors="coerce") == 3).mean() * 100.0) if not metric_A.empty else None,
+                    "pct_has_contradiction": float((metric_A.loc[metric_A["status"] == "success", ["walle_l1l2", "walle_l2l3", "walle_l3l4", "walle_overall"]].apply(pd.to_numeric, errors="coerce") == 0).any(axis=1).mean() * 100.0) if not metric_A.empty else None,
+                    "most_common_weakest": metric_A.loc[metric_A["status"] == "success", "walle_weakest"].astype(str).value_counts().head(1).index[0] if "walle_weakest" in metric_A.columns and not metric_A.empty else None,
+                },
+                {
+                    "model": "DEX",
+                    "mean_l1l2": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "dex_l1l2"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_l2l3": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "dex_l2l3"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_l3l4": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "dex_l3l4"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "mean_overall": float(pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "dex_overall"], errors="coerce").mean()) if not metric_A.empty else None,
+                    "pct_score3": float((pd.to_numeric(metric_A.loc[metric_A["status"] == "success", "dex_overall"], errors="coerce") == 3).mean() * 100.0) if not metric_A.empty else None,
+                    "pct_has_contradiction": float((metric_A.loc[metric_A["status"] == "success", ["dex_l1l2", "dex_l2l3", "dex_l3l4", "dex_overall"]].apply(pd.to_numeric, errors="coerce") == 0).any(axis=1).mean() * 100.0) if not metric_A.empty else None,
+                    "most_common_weakest": metric_A.loc[metric_A["status"] == "success", "dex_weakest"].astype(str).value_counts().head(1).index[0] if "dex_weakest" in metric_A.columns and not metric_A.empty else None,
+                },
+            ]
+        )
+
+        # Metric B
+        class BOut(BaseModel):
+            action: int = Field(..., ge=0, le=2)
+            action_reason: str
+            system: int = Field(..., ge=0, le=2)
+            system_reason: str
+            routing: int = Field(..., ge=0, le=2)
+            routing_reason: str
+            composite: int
+            automation_action: str | None = None
+
+        agentB = Agent(model, output_type=BOut, model_settings=ms)
+        promptB = (
+            "You are evaluating whether an IT incident classification path contains \n"
+            "enough specificity to trigger or inform an automated resolution workflow.\n\n"
+            "Path: {path}\n\n"
+            "Score three dimensions (0, 1, or 2):\n\n"
+            "ACTION SPECIFICITY — Does the path indicate what action to take?\n"
+            "  2=specific action stated (unlock account, clear cache, power cycle, redeploy)\n"
+            "  1=action type implied but not specific (configuration change, access grant)\n"
+            "  0=only the symptom described, no action signal\n\n"
+            "SYSTEM SPECIFICITY — Does the path name a specific product or system?\n"
+            "  2=specific named product (Cisco Secure Client, Windows Hello, Citrix Workspace)\n"
+            "  1=product category (VPN client, authenticator app, business application)\n"
+            "  0=generic type only (Software, Network, Application, Error/Failure)\n\n"
+            "ROUTING UNIQUENESS — Could this path route to exactly one team or script?\n"
+            "  2=uniquely routes to one team and one workflow\n"
+            "  1=narrows to 2-3 teams or workflows\n"
+            "  0=too broad, many teams could apply\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\"action\":0-2,\"action_reason\":\"one sentence\",\n"
+            " \"system\":0-2,\"system_reason\":\"one sentence\",\n"
+            " \"routing\":0-2,\"routing_reason\":\"one sentence\",\n"
+            " \"composite\":sum_of_three,\n"
+            " \"automation_action\":\"what specific action this enables or None\"}\n"
+        )
+        bw = [promptB.format(path=p) for p in A_base["walle_path"].fillna("(none)").tolist()]
+        bd = [promptB.format(path=p) for p in A_base["dex_path"].fillna("(none)").tolist()]
+        obw = asyncio.run(_run_agent_prompts_parallel(agent=agentB, prompts=bw, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_B_WALLE"))
+        obd = asyncio.run(_run_agent_prompts_parallel(agent=agentB, prompts=bd, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_B_DEX"))
+        B_rows: list[dict] = []
+        for i, rr in enumerate(A_base.itertuples(index=False)):
+            row = {"INC_ID": rr.INC_ID, "walle_path": rr.walle_path, "dex_path": rr.dex_path}
+            for obj, pref in [(obw[i], "walle"), (obd[i], "dex")]:
+                if obj.get("error"):
+                    row[f"{pref}_error"] = obj.get("error")
+                else:
+                    row[f"{pref}_action"] = obj.get("action")
+                    row[f"{pref}_system"] = obj.get("system")
+                    row[f"{pref}_routing"] = obj.get("routing")
+                    row[f"{pref}_composite"] = obj.get("composite")
+                    row[f"{pref}_automation_action"] = obj.get("automation_action")
+            row["status"] = "success" if ("walle_error" not in row and "dex_error" not in row) else "llm_failed"
+            B_rows.append(row)
+        metric_B = pd.DataFrame(B_rows)
+        metric_B_summary = pd.DataFrame(
+            [
+                {
+                    "model": "WALLE",
+                    "mean_composite": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_composite"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "pct_high": float((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_composite"], errors="coerce") >= 5).mean() * 100.0) if not metric_B.empty else None,
+                    "pct_medium": float(((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_composite"], errors="coerce") >= 3) & (pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_composite"], errors="coerce") <= 4)).mean() * 100.0) if not metric_B.empty else None,
+                    "pct_low": float((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_composite"], errors="coerce") <= 2).mean() * 100.0) if not metric_B.empty else None,
+                    "mean_action": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_action"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "mean_system": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_system"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "mean_routing": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "walle_routing"], errors="coerce").mean()) if not metric_B.empty else None,
+                },
+                {
+                    "model": "DEX",
+                    "mean_composite": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_composite"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "pct_high": float((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_composite"], errors="coerce") >= 5).mean() * 100.0) if not metric_B.empty else None,
+                    "pct_medium": float(((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_composite"], errors="coerce") >= 3) & (pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_composite"], errors="coerce") <= 4)).mean() * 100.0) if not metric_B.empty else None,
+                    "pct_low": float((pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_composite"], errors="coerce") <= 2).mean() * 100.0) if not metric_B.empty else None,
+                    "mean_action": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_action"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "mean_system": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_system"], errors="coerce").mean()) if not metric_B.empty else None,
+                    "mean_routing": float(pd.to_numeric(metric_B.loc[metric_B["status"] == "success", "dex_routing"], errors="coerce").mean()) if not metric_B.empty else None,
+                },
+            ]
+        )
+
+        # Metric G: cluster report from top 20 viable per model
+        def classify_intervention(path: str) -> str:
+            p = (path or "").lower()
+            if any(w in p for w in ["account lock", "password reset", "unlock", "pin reset"]):
+                return "Virtual Agent / Self-Service"
+            if any(w in p for w in ["cache", "reboot", "restart", "power cycle"]):
+                return "L1 Automation Script"
+            if any(w in p for w in ["access denied", "provisioning", "license", "permission", "access - new"]):
+                return "Access Request Automation"
+            if any(w in p for w in ["citrix", "vpn", "zscaler", "wi-fi", "wifi", "network"]):
+                return "Infrastructure Configuration Fix"
+            if any(w in p for w in ["training", "how-to", "guidance", "informational"]):
+                return "Knowledge Base Deflection"
+            if any(w in p for w in ["outage", "isp", "vendor", "third-party", "third party"]):
+                return "Vendor SLA / Escalation"
+            return "Process Redesign"
+
+        class GOut(BaseModel):
+            intervention: str
+            owning_team: str
+            success_metric: str
+
+        agentG = Agent(model, output_type=GOut, model_settings=ms)
+        promptG = (
+            "You are an IT service improvement advisor helping leaders set incident \n"
+            "reduction MBO targets.\n\n"
+            "Incident cluster path: {path}\n"
+            "Incidents in cluster: {count} ({pct}% of total)\n"
+            "Preliminary intervention type: {type}\n\n"
+            "Suggest a concrete plan for this cluster:\n"
+            "1. One specific intervention to reduce these incidents (2-3 sentences, practical)\n"
+            "2. Which team or role should own the reduction target\n"
+            "3. How to measure success (one metric)\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\"intervention\":\"2-3 sentences\",\"owning_team\":\"team name or role\",\n"
+            " \"success_metric\":\"how to measure\"}\n"
+        )
+        viable = metric_C[metric_C["mbo_viable"] == True]  # noqa: E712
+        topw = viable[viable["model"] == "WALLE"].head(20)
+        topd = viable[viable["model"] == "DEX"].head(20)
+        g_items: list[dict] = []
+        g_prompts: list[str] = []
+        for dfm, model_name in [(topw, "WALLE"), (topd, "DEX")]:
+            for rr in dfm.itertuples(index=False):
+                itype = classify_intervention(str(rr.full_path))
+                g_items.append(
+                    {
+                        "model": model_name,
+                        "rank": int(rr.rank_by_volume),
+                        "full_path": rr.full_path,
+                        "l1_domain": rr.l1_domain,
+                        "l2_category": rr.l2_category,
+                        "l3_subcategory": rr.l3_subcategory,
+                        "l4_key_issue": rr.l4_key_issue,
+                        "incident_count": int(rr.incident_count),
+                        "pct_of_total": float(rr.pct_of_total),
+                        "cumulative_pct": float(rr.cumulative_pct),
+                        "intervention_type": itype,
+                        "mean_path_consistency_score": None,
+                        "mean_automation_score": None,
+                    }
+                )
+                g_prompts.append(promptG.format(path=rr.full_path, count=int(rr.incident_count), pct=float(rr.pct_of_total), type=itype))
+        og = asyncio.run(_run_agent_prompts_parallel(agent=agentG, prompts=g_prompts, workers=max(1, min(int(args.llm_judge_workers), 5)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_G"))
+        g_rows: list[dict] = []
+        for i, base in enumerate(g_items):
+            obj = og[i]
+            row = dict(base)
+            if obj.get("error"):
+                row["status"] = "llm_failed"
+            else:
+                row["specific_intervention"] = obj.get("intervention")
+                row["owning_team"] = obj.get("owning_team")
+                row["success_metric"] = obj.get("success_metric")
+                row["status"] = "success"
+            g_rows.append(row)
+        metric_G = pd.DataFrame(g_rows)
+    else:
+        metric_A = pd.DataFrame([{"status": "skipped", "reason": "Enable --llm-judge (and Azure env vars) for Metric A"}])
+        metric_A_summary = pd.DataFrame([{"status": "skipped"}])
+        metric_B = pd.DataFrame([{"status": "skipped", "reason": "Enable --llm-judge (and Azure env vars) for Metric B"}])
+        metric_B_summary = pd.DataFrame([{"status": "skipped"}])
+        metric_G = pd.DataFrame([{"status": "skipped", "reason": "Enable --llm-judge (and Azure env vars) for Metric G"}])
+
     per_sheet_lines: dict[str, list[str]] = {
         "data": [
             "HOW TO READ THIS SHEET (data)",
@@ -1804,6 +2405,46 @@ def main() -> int:
             "- Averages are as reported by the judge in structured output; validate sampling and prompt version across runs.",
             "- If you change the prompt, do not compare these summary numbers across runs without re-judging the same sample.",
         ],
+        "metric_A_path_consistency": [
+            "METRIC A: PATH CONSISTENCY (metric_A_path_consistency)",
+            "- LLM scores structural coherence of the 4-level path (not correctness).",
+        ],
+        "metric_A_path_consistency_summary": [
+            "METRIC A (SUMMARY): PATH CONSISTENCY SUMMARY (metric_A_path_consistency_summary)",
+            "- Two rows: WALLE and DEX aggregate means and weakest-link stats.",
+        ],
+        "metric_B_path_automation": [
+            "METRIC B: PATH AUTOMATION (metric_B_path_automation)",
+            "- LLM scores action/system/routing specificity (0-6 composite).",
+        ],
+        "metric_B_path_automation_summary": [
+            "METRIC B (SUMMARY): PATH AUTOMATION SUMMARY (metric_B_path_automation_summary)",
+            "- Two rows: WALLE and DEX with composite distributions and dimension means.",
+        ],
+        "metric_C_mbo_clusters": [
+            "METRIC C: MBO CLUSTERS (metric_C_mbo_clusters)",
+            "- Group by full path to find Pareto clusters and mbo_viable targets.",
+        ],
+        "metric_D_path_stability": [
+            "METRIC D: PATH STABILITY (metric_D_path_stability)",
+            "- For text-similar pairs (TF-IDF cosine>=0.35), check whether each model assigns the same path and L1.",
+        ],
+        "metric_E_confidence_calibration": [
+            "METRIC E: CONFIDENCE CALIBRATION (metric_E_confidence_calibration)",
+            "- Join WALLE L4 confidence to Metric 6 judge scores; compute Pearson r and bin means.",
+        ],
+        "metric_F_resolution_coherence": [
+            "METRIC F: RESOLUTION COHERENCE (metric_F_resolution_coherence)",
+            "- TF-IDF similarity between model path and resolution/work-notes text; includes winner flags.",
+        ],
+        "metric_F_coherence_summary": [
+            "METRIC F (SUMMARY): COHERENCE SUMMARY (metric_F_coherence_summary)",
+            "- Two rows: WALLE and DEX mean similarities and win rates.",
+        ],
+        "metric_G_mbo_cluster_report": [
+            "METRIC G: MBO CLUSTER REPORT (metric_G_mbo_cluster_report)",
+            "- Top 20 mbo_viable clusters per model with rule-based intervention_type + LLM plan.",
+        ],
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1820,9 +2461,21 @@ def main() -> int:
         metric_5_pairs.to_excel(xw, sheet_name="metric_5_top_disagreement_in_strata", index=False)
         metric_6_rows.to_excel(xw, sheet_name="metric_6_llm_judge_rows", index=False)
         metric_6_summary.to_excel(xw, sheet_name="metric_6_llm_judge_summary", index=False)
+        metric_A.to_excel(xw, sheet_name="metric_A_path_consistency", index=False)
+        metric_A_summary.to_excel(xw, sheet_name="metric_A_path_consistency_summary", index=False)
+        metric_B.to_excel(xw, sheet_name="metric_B_path_automation", index=False)
+        metric_B_summary.to_excel(xw, sheet_name="metric_B_path_automation_summary", index=False)
+        metric_C.to_excel(xw, sheet_name="metric_C_mbo_clusters", index=False)
+        metric_D.to_excel(xw, sheet_name="metric_D_path_stability", index=False)
+        metric_E.to_excel(xw, sheet_name="metric_E_confidence_calibration", index=False)
+        metric_F.to_excel(xw, sheet_name="metric_F_resolution_coherence", index=False)
+        metric_F_summary.to_excel(xw, sheet_name="metric_F_coherence_summary", index=False)
+        metric_G.to_excel(xw, sheet_name="metric_G_mbo_cluster_report", index=False)
 
     # Prepend explainability into each sheet (so guidance lives with the tab).
     _prepend_sheet_explainability(output_path, per_sheet_lines)
+    if blocks_to_append:
+        _append_blocks_after_write(output_path, blocks_to_append)
 
     print(f"Wrote report: {output_path}", flush=True)
     print(metric_1.to_string(index=False), flush=True)
