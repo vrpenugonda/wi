@@ -928,6 +928,60 @@ async def _run_llm_judge_parallel(
     return list(await asyncio.gather(*tasks))
 
 
+async def _run_agent_prompts_parallel(
+    *,
+    agent: Any,
+    prompts: list[str],
+    workers: int,
+    max_retries: int,
+    progress_label: str,
+) -> list[dict[str, Any]]:
+    """
+    Parallel runner for generic `agent.run(prompt)` calls.
+    - Limits concurrency with asyncio.Semaphore(workers)
+    - Preserves order via asyncio.gather
+    - Retries 429/5xx using the same backoff logic as other LLM calls
+    """
+    import asyncio
+
+    workers = max(1, int(workers))
+    sem = asyncio.Semaphore(workers)
+    lock = asyncio.Lock()
+    state = [0]
+    total = len(prompts)
+
+    async def one(prompt: str) -> dict[str, Any]:
+        async with sem:
+            attempt = 0
+            while True:
+                try:
+                    res = await agent.run(prompt)
+                    obj = _agent_run_result_to_judge_dict(res)
+                    async with lock:
+                        state[0] += 1
+                        done = state[0]
+                        if total > 0 and (done % max(1, total // 20) == 0 or done == total):
+                            print(f"[{progress_label}] completed {done}/{total}", flush=True)
+                    return obj
+                except Exception as e:
+                    attempt += 1
+                    retryable, status, retry_after = _is_retryable_azure_error(e)
+                    if retryable and attempt <= max_retries:
+                        backoff = min(60.0, (2.0 ** min(attempt, 6)))
+                        sleep_for = float(retry_after) if retry_after is not None else float(backoff)
+                        await asyncio.sleep(sleep_for)
+                        continue
+                    async with lock:
+                        state[0] += 1
+                        done = state[0]
+                        if total > 0 and (done % max(1, total // 20) == 0 or done == total):
+                            print(f"[{progress_label}] completed {done}/{total}", flush=True)
+                    return {"error": str(e)[:800], "status_code": status, "attempts": attempt}
+
+    tasks = [asyncio.create_task(one(p)) for p in prompts]
+    return list(await asyncio.gather(*tasks))
+
+
 def _prepend_sheet_explainability(
     xlsx_path: Path,
     per_sheet_lines: dict[str, list[str]],
