@@ -2050,23 +2050,25 @@ def main() -> int:
             reason: str
 
         agentA = Agent(model, output_type=AOut, model_settings=ms)
-        promptA = (
-            "You are evaluating an IT incident classification path for internal coherence.\n"
-            "Score only structural consistency — not whether the classification is correct.\n\n"
-            "Path: {path}\n\n"
-            "Score each level transition (0=contradiction, 1=unrelated, 2=loosely consistent, 3=fully consistent):\n"
-            "  L1→L2: Does Category follow from Domain?\n"
-            "  L2→L3: Does Subcategory follow from Category?\n"
-            "  L3→L4: Does Key Issue follow from Subcategory?\n"
-            "  overall: Is this a coherent business address for one incident type?\n\n"
-            "Return ONLY valid JSON:\n"
-            "{\"l1l2\":0-3,\"l2l3\":0-3,\"l3l4\":0-3,\"overall\":0-3,\n"
-            " \"weakest\":\"L1→L2|L2→L3|L3→L4|None\",\"reason\":\"one sentence\"}\n"
-        )
+
+        def _promptA(path: str) -> str:
+            return (
+                "You are evaluating an IT incident classification path for internal coherence.\n"
+                "Score only structural consistency — not whether the classification is correct.\n\n"
+                f"Path: {path}\n\n"
+                "Score each level transition (0=contradiction, 1=unrelated, 2=loosely consistent, 3=fully consistent):\n"
+                "  L1→L2: Does Category follow from Domain?\n"
+                "  L2→L3: Does Subcategory follow from Category?\n"
+                "  L3→L4: Does Key Issue follow from Subcategory?\n"
+                "  overall: Is this a coherent business address for one incident type?\n\n"
+                "Return ONLY valid JSON:\n"
+                '{"l1l2":0-3,"l2l3":0-3,"l3l4":0-3,"overall":0-3,\n'
+                ' "weakest":"L1→L2|L2→L3|L3→L4|None","reason":"one sentence"}\n'
+            )
         A_base = df_view[["INC_ID", "walle_path", "dex_path"]].copy()
         A_base = A_base[(A_base["walle_path"].notna()) | (A_base["dex_path"].notna())].reset_index(drop=True)
-        pw = [promptA.format(path=p) for p in A_base["walle_path"].fillna("(none)").tolist()]
-        pdx = [promptA.format(path=p) for p in A_base["dex_path"].fillna("(none)").tolist()]
+        pw = [_promptA(p) for p in A_base["walle_path"].fillna("(none)").tolist()]
+        pdx = [_promptA(p) for p in A_base["dex_path"].fillna("(none)").tolist()]
         ow = asyncio.run(_run_agent_prompts_parallel(agent=agentA, prompts=pw, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_A_WALLE"))
         od = asyncio.run(_run_agent_prompts_parallel(agent=agentA, prompts=pdx, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_A_DEX"))
         A_rows: list[dict] = []
@@ -2122,10 +2124,12 @@ def main() -> int:
             automation_action: str | None = None
 
         agentB = Agent(model, output_type=BOut, model_settings=ms)
-        promptB = (
+
+        def _promptB(path: str) -> str:
+            return (
             "You are evaluating whether an IT incident classification path contains \n"
             "enough specificity to trigger or inform an automated resolution workflow.\n\n"
-            "Path: {path}\n\n"
+            f"Path: {path}\n\n"
             "Score three dimensions (0, 1, or 2):\n\n"
             "ACTION SPECIFICITY — Does the path indicate what action to take?\n"
             "  2=specific action stated (unlock account, clear cache, power cycle, redeploy)\n"
@@ -2140,14 +2144,15 @@ def main() -> int:
             "  1=narrows to 2-3 teams or workflows\n"
             "  0=too broad, many teams could apply\n\n"
             "Return ONLY valid JSON:\n"
-            "{\"action\":0-2,\"action_reason\":\"one sentence\",\n"
-            " \"system\":0-2,\"system_reason\":\"one sentence\",\n"
-            " \"routing\":0-2,\"routing_reason\":\"one sentence\",\n"
-            " \"composite\":sum_of_three,\n"
-            " \"automation_action\":\"what specific action this enables or None\"}\n"
-        )
-        bw = [promptB.format(path=p) for p in A_base["walle_path"].fillna("(none)").tolist()]
-        bd = [promptB.format(path=p) for p in A_base["dex_path"].fillna("(none)").tolist()]
+            '{"action":0-2,"action_reason":"one sentence",\n'
+            ' "system":0-2,"system_reason":"one sentence",\n'
+            ' "routing":0-2,"routing_reason":"one sentence",\n'
+            ' "composite":sum_of_three,\n'
+            ' "automation_action":"what specific action this enables or None"}\n'
+            )
+
+        bw = [_promptB(p) for p in A_base["walle_path"].fillna("(none)").tolist()]
+        bd = [_promptB(p) for p in A_base["dex_path"].fillna("(none)").tolist()]
         obw = asyncio.run(_run_agent_prompts_parallel(agent=agentB, prompts=bw, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_B_WALLE"))
         obd = asyncio.run(_run_agent_prompts_parallel(agent=agentB, prompts=bd, workers=max(1, int(args.llm_judge_workers)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_B_DEX"))
         B_rows: list[dict] = []
@@ -2213,20 +2218,22 @@ def main() -> int:
             success_metric: str
 
         agentG = Agent(model, output_type=GOut, model_settings=ms)
-        promptG = (
+
+        def _promptG(path: str, count: int, pct: float, itype: str) -> str:
+            return (
             "You are an IT service improvement advisor helping leaders set incident \n"
             "reduction MBO targets.\n\n"
-            "Incident cluster path: {path}\n"
-            "Incidents in cluster: {count} ({pct}% of total)\n"
-            "Preliminary intervention type: {type}\n\n"
+            f"Incident cluster path: {path}\n"
+            f"Incidents in cluster: {count} ({pct}% of total)\n"
+            f"Preliminary intervention type: {itype}\n\n"
             "Suggest a concrete plan for this cluster:\n"
             "1. One specific intervention to reduce these incidents (2-3 sentences, practical)\n"
             "2. Which team or role should own the reduction target\n"
             "3. How to measure success (one metric)\n\n"
             "Return ONLY valid JSON:\n"
-            "{\"intervention\":\"2-3 sentences\",\"owning_team\":\"team name or role\",\n"
-            " \"success_metric\":\"how to measure\"}\n"
-        )
+            '{"intervention":"2-3 sentences","owning_team":"team name or role",\n'
+            ' "success_metric":"how to measure"}\n'
+            )
         viable = metric_C[metric_C["mbo_viable"] == True]  # noqa: E712
         topw = viable[viable["model"] == "WALLE"].head(20)
         topd = viable[viable["model"] == "DEX"].head(20)
@@ -2252,7 +2259,7 @@ def main() -> int:
                         "mean_automation_score": None,
                     }
                 )
-                g_prompts.append(promptG.format(path=rr.full_path, count=int(rr.incident_count), pct=float(rr.pct_of_total), type=itype))
+                g_prompts.append(_promptG(str(rr.full_path), int(rr.incident_count), float(rr.pct_of_total), itype))
         og = asyncio.run(_run_agent_prompts_parallel(agent=agentG, prompts=g_prompts, workers=max(1, min(int(args.llm_judge_workers), 5)), max_retries=int(args.llm_judge_max_retries), progress_label="metric_G"))
         g_rows: list[dict] = []
         for i, base in enumerate(g_items):
