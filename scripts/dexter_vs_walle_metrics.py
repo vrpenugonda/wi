@@ -683,23 +683,12 @@ def _flatten_judge_out_for_excel(
     return out
 
 
-def _judge_with_pydantic_ai(
-    *,
-    user_prompt: str,
-) -> dict[str, Any]:
+def _create_llm_judge_agent() -> Any:
     """
-    Run a single judge request using the same stack as L4 classification:
-    pydantic-ai Agent + OpenAIChatModel(provider='azure') + extra_headers.
-
-    Expects env vars to be set by the workflow:
-      - AZURE_OPENAI_API_KEY (AAD token)
-      - AZURE_OPENAI_ENDPOINT
-      - AZURE_OPENAI_API_VERSION
-      - AZURE_OPENAI_DEPLOYMENT_NAME
-      - X_UPSTREAM_ENV / PROJECT_ID (optional gateway headers)
+    Build a single pydantic-ai Agent for WALLE vs DEX judge (same stack as L4).
+    Reuse one agent across concurrent runs (asyncio.gather + Semaphore), like batch workers in BaseClassifier.
     """
     import os
-    import asyncio
     from pydantic import BaseModel, Field
     from pydantic_ai import Agent
     from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
@@ -757,7 +746,6 @@ def _judge_with_pydantic_ai(
     if not deployment:
         raise RuntimeError("Missing AZURE_OPENAI_DEPLOYMENT_NAME for pydantic-ai judge")
 
-    # Mirror BaseClassifier.get_model() behavior: ensure OPENAI_API_VERSION is set.
     if not (os.getenv("OPENAI_API_VERSION") or "").strip():
         v = (os.getenv("AZURE_OPENAI_API_VERSION") or "").strip()
         if v:
@@ -780,19 +768,108 @@ def _judge_with_pydantic_ai(
         extra_headers["projectId"] = project_id
 
     settings = OpenAIChatModelSettings(extra_headers=extra_headers) if extra_headers else OpenAIChatModelSettings()
-    agent = Agent(model, output_type=JudgeOut, model_settings=settings, system_prompt=_LLM_JUDGE_SYSTEM)
+    return Agent(model, output_type=JudgeOut, model_settings=settings, system_prompt=_LLM_JUDGE_SYSTEM)
 
-    async def _run() -> JudgeOut:
-        res = await agent.run(user_prompt)
-        # pydantic-ai versions differ: some expose `.data`, others `.output`.
-        if hasattr(res, "data"):
-            return res.data  # type: ignore[return-value]
-        if hasattr(res, "output"):
-            return res.output  # type: ignore[return-value]
+
+def _agent_run_result_to_judge_dict(res: Any) -> dict[str, Any]:
+    if hasattr(res, "data"):
+        out = res.data
+    elif hasattr(res, "output"):
+        out = res.output
+    else:
         raise RuntimeError(f"Unexpected AgentRunResult shape: {type(res)}")
+    if hasattr(out, "model_dump"):
+        return out.model_dump()
+    return dict(out)
 
-    out = asyncio.run(_run())
-    return out.model_dump()
+
+async def _judge_one_incident_async(
+    agent: Any,
+    *,
+    semaphore: Any,
+    inc_id: str,
+    user_prompt: str,
+    wal: dict[str, str],
+    dex: dict[str, str],
+    max_retries: int,
+    progress_lock: Any,
+    progress_state: list[int],
+    total: int,
+) -> dict[str, Any]:
+    """One incident under semaphore; retries with asyncio.sleep (L4-style transient handling)."""
+    import asyncio
+
+    async with semaphore:
+        attempt = 0
+        while True:
+            try:
+                res = await agent.run(user_prompt)
+                obj = _agent_run_result_to_judge_dict(res)
+                rec = _flatten_judge_out_for_excel(inc_id, wal, dex, obj)
+                async with progress_lock:
+                    progress_state[0] += 1
+                    done = progress_state[0]
+                    if done % max(1, total // 20) == 0 or done == total:
+                        print(f"[LLM-judge] completed {done}/{total}", flush=True)
+                return rec
+            except Exception as e:
+                attempt += 1
+                retryable, status, retry_after = _is_retryable_azure_error(e)
+                if retryable and attempt <= max_retries:
+                    sleep_for = float(retry_after) if retry_after is not None else min(60.0, (2.0 ** min(attempt, 6)))
+                    await asyncio.sleep(sleep_for)
+                    continue
+                async with progress_lock:
+                    progress_state[0] += 1
+                    done = progress_state[0]
+                    if done % max(1, total // 20) == 0 or done == total:
+                        print(f"[LLM-judge] completed {done}/{total}", flush=True)
+                return {
+                    "INC_ID": inc_id,
+                    "error": str(e)[:800],
+                    "status_code": status,
+                    "attempts": attempt,
+                }
+
+
+async def _run_llm_judge_parallel(
+    work_items: list[dict[str, Any]],
+    *,
+    workers: int,
+    max_retries: int,
+) -> list[dict[str, Any]]:
+    """
+    Parallel judge pass (same spirit as BaseClassifier._classify_single_worker):
+    asyncio.Semaphore(workers) limits in-flight requests; asyncio.gather preserves input order.
+    """
+    import asyncio
+
+    agent = _create_llm_judge_agent()
+    workers = max(1, int(workers))
+    semaphore = asyncio.Semaphore(workers)
+    progress_lock = asyncio.Lock()
+    progress_state = [0]
+    total = len(work_items)
+
+    tasks = [
+        asyncio.create_task(
+            _judge_one_incident_async(
+                agent,
+                semaphore=semaphore,
+                inc_id=wi["inc_id"],
+                user_prompt=wi["user_prompt"],
+                wal=wi["wal"],
+                dex=wi["dex"],
+                max_retries=max_retries,
+                progress_lock=progress_lock,
+                progress_state=progress_state,
+                total=total,
+            )
+        )
+        for wi in work_items
+    ]
+    # Results are in the same order as work_items / tasks.
+    return list(await asyncio.gather(*tasks))
 
 
 def _prepend_sheet_explainability(
@@ -863,7 +940,10 @@ def main() -> int:
         "--llm-judge-max-rpm",
         type=int,
         default=30,
-        help="Hard cap for judge requests per minute (proactive throttle). Default 30 to stay safe in workflows.",
+        help=(
+            "Legacy: was used for sequential spacing between judge calls. "
+            "Parallel judge uses --llm-judge-workers for concurrency instead; this flag is currently unused."
+        ),
     )
     p.add_argument(
         "--llm-judge-max-context-chars",
@@ -876,6 +956,15 @@ def main() -> int:
         type=int,
         default=6,
         help="Max retries per judge call on 429/5xx with exponential backoff.",
+    )
+    p.add_argument(
+        "--llm-judge-workers",
+        type=int,
+        default=5,
+        help=(
+            "Concurrent LLM judge tasks (asyncio.Semaphore), same idea as L4 batch workers. "
+            "Default 5. Use 1 for sequential. Lower if you hit 429/rate limits."
+        ),
     )
     args = p.parse_args()
 
@@ -1358,10 +1447,8 @@ def main() -> int:
                 return s.strip()
 
             colset = set(candidates.columns)
-            judge_out: list[dict] = []
-            failures = 0
-            last_call_ts: float | None = None
-            for idx, row in candidates.iterrows():
+            work_items: list[dict[str, Any]] = []
+            for _idx, row in candidates.iterrows():
                 inc_id = _safe_txt(row.get("INC_ID"))
                 incident_fields = _build_llm_judge_incident_fields(row, safe_txt=_safe_txt, columns=colset)
                 dex = {
@@ -1376,48 +1463,37 @@ def main() -> int:
                     "L3": _safe_txt(row.get("WALLE_L3")),
                     "L4": _safe_txt(row.get("WALLE_L4")),
                 }
-
                 user = _llm_judge_user_prompt(incident=incident_fields, walle=wal, dex=dex)
                 max_ctx = int(args.llm_judge_max_context_chars)
                 if max_ctx > 0 and len(user) > max_ctx:
                     user = user[:max_ctx] + "\n\n[TRUNCATED: user prompt exceeded --llm-judge-max-context-chars]"
+                work_items.append({"inc_id": inc_id, "user_prompt": user, "wal": wal, "dex": dex})
 
-                # Proactive throttle to avoid RPM limit (sequential judge calls).
-                last_call_ts = _maybe_sleep_for_rpm(last_call_ts, int(args.llm_judge_max_rpm))
+            import asyncio
 
-                attempt = 0
-                while True:
-                    try:
-                        # IDENTICAL to L4 approach: pydantic-ai Agent + OpenAIChatModel(provider="azure")
-                        # with gateway headers via OpenAIChatModelSettings. No REST fallback.
-                        obj = _judge_with_pydantic_ai(user_prompt=user)
-                        rec = _flatten_judge_out_for_excel(inc_id, wal, dex, obj)
-                        judge_out.append(rec)
-                        break
-                    except Exception as e:
-                        attempt += 1
-                        # Keep a small retry loop for transient gateway/availability issues.
-                        # We don't attempt payload mutation or alternate clients (no fallback).
-                        retryable, status, retry_after = _is_retryable_azure_error(e)
-                        if retryable and attempt <= int(args.llm_judge_max_retries):
-                            backoff = min(60.0, (2.0 ** min(attempt, 6)))
-                            sleep_for = retry_after if retry_after is not None else backoff
-                            time.sleep(float(sleep_for))
-                            continue
-                        failures += 1
-                        judge_out.append(
-                            {
-                                "INC_ID": inc_id,
-                                "error": str(e)[:800],
-                                "status_code": status,
-                                "attempts": attempt,
-                            }
-                        )
-                        break
+            workers = max(1, int(args.llm_judge_workers))
+            if not work_items:
+                judge_out = []
+            else:
+                print(
+                    f"[LLM-judge] starting {len(work_items)} incidents with workers={workers} "
+                    f"(order preserved via asyncio.gather)",
+                    flush=True,
+                )
+                judge_out = asyncio.run(
+                    _run_llm_judge_parallel(
+                        work_items,
+                        workers=workers,
+                        max_retries=int(args.llm_judge_max_retries),
+                    )
+                )
+            failures = sum(1 for r in judge_out if r.get("error"))
 
             metric_6_rows = pd.DataFrame(judge_out)
             total_judged = int(len(metric_6_rows))
-            llm_lines.append(f"- Judged rows: {total_judged} (failures: {failures}).")
+            llm_lines.append(
+                f"- Judged rows: {total_judged} (failures: {failures}); parallel workers={workers}."
+            )
 
             # Aggregate verdicts and mean reported averages (successful rows only).
             summary_rows: list[dict] = []
@@ -1700,6 +1776,7 @@ def main() -> int:
         "metric_6_llm_judge_rows": [
             "METRIC 6: LLM-AS-JUDGE (ROW-LEVEL) (metric_6_llm_judge_rows)",
             "- Meaning: Full rubric — WALLE vs DEX on 7 scored dimensions (D1-D7), per-model section averages, and verdict (single incident only).",
+            "- Execution: incidents are judged in parallel (asyncio.Semaphore + gather) like L4 batch workers; row order in this sheet matches the sampled input order.",
             "- Incident text: INC_BRIEF_DESCRIPTION (+ error msg), long description bundle (ACTION/COMMENTS/UPDATE_ACTION), RESOLUTION, work notes (COMMENTS/MONITORING), steps (UPDATE_ACTION_ESS/UPDATE_ACTION). KB fields: not in extract → judge marks D3 as N.",
             "- Columns: WALLE_/DEX_ L1-L4 inputs; walle_D1..D7_score/reasoning (+ D5/D6 examples); walle_/dex_ summary averages; verdict_* fields.",
             "INFERENCES FROM THIS RUN",
