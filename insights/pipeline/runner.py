@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -263,11 +264,11 @@ class ClassificationPipeline:
             combined_l4_df = pd.concat(all_l4_dfs, ignore_index=True)
             logger.debug(f"Combined L4 df: {len(combined_l4_df)} records")
             
-            # Clean up invalid L4 categories - but KEEP Unclassified_L4 (it's a valid classification)
-            # Only remove truly invalid categories the model invents
+            #Clean up invalid L4 categories - but keep Unclassified_L4 (it's a valid classification)
+            #Only remve truly invalid categories the model invents
             if 'l4_category' in combined_l4_df.columns:
-                # Note: Do NOT remove "unclassified_l4" - it's a valid category indicating insufficient info
-                # Only remove invented categories like "insufficient_information", "unknown", etc.
+                #Note: Do NOT remove "unclassified_l4" - it's a valid category indicating insufficeint info
+                #Only remove invented categories like "insufficient_information", "unknown", etc.
                 invalid_pattern = r'^(insufficient|unknown|missing|unable_to_classify|pending_details|n/a|none)$|insufficient_|_unknown$|_missing$'
                 invalid_mask = combined_l4_df['l4_category'].str.lower().str.match(invalid_pattern, na=False)
                 invalid_count = invalid_mask.sum()
@@ -363,7 +364,7 @@ class ClassificationPipeline:
             from ..utils.l4_null_logging import L4NullRow, record_l4_nulls
 
             def _is_missing_l4(v) -> bool:
-                if v is None:
+                if v is None or pd.isna(v):
                     return True
                 s = str(v).strip()
                 return s == "" or s.lower() == "none"

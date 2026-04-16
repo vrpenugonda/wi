@@ -158,6 +158,5 @@ def record_l4_nulls(
         "persist_error": persist_error,
         "breakdown": summary,
         "snowflake_table": table_name,
-        "snowflake_target": f"{settings.snowflake_database}.{settings.snowflake_schema}.{table_name}",
+        "snowflake_target": f"{settings.snowflake_database_test}.{settings.snowflake_schema_test}.{table_name}",
     }
-

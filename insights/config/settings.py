@@ -55,8 +55,8 @@ class Settings(BaseSettings):
     
     # Snowflake Configuration
     snowflake_account: str = Field(default="", alias="SNOWFLAKE_ACCOUNT")
-    snowflake_database: str = Field(default="", alias="SNOWFLAKE_DATABASE")
-    snowflake_schema: str = Field(default="", alias="SNOWFLAKE_SCHEMA")
+    snowflake_database_test: str = Field(default="", alias="SNOWFLAKE_DATABASE_TEST")
+    snowflake_schema_test: str = Field(default="", alias="SNOWFLAKE_SCHEMA_TEST")
     snowflake_user: str = Field(default="", alias="SNOWFLAKE_USER")
     snowflake_warehouse: str = Field(default="", alias="SNOWFLAKE_WAREHOUSE")
     snowflake_certificate: str = Field(default="", alias="SNOWFLAKE_CERTIFICATE")
