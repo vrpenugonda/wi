@@ -25,7 +25,7 @@ Evidence in code:
 
 Phase 1 improvements must therefore focus on:
 - deterministic validation,
-- retry-on-invalid,
+- controlled bucketing + audit (avoid delaying the main run),
 - remediation workflows,
 - stronger auditing/telemetry,
 - bulk-run reliability mechanics,
@@ -46,7 +46,7 @@ Phase 1 improvements must therefore focus on:
 - **Taxonomy**: derived per subcategory and cached (local + S3).
 - **Behavior today**:
   - L4 classification enforces “category must be in taxonomy” at runtime: invalid categories trigger a retry of the full batch.
-  - Uses a strict fallback label `Unclassified_L4` (discouraged; tracked).
+  - Uses a strict fallback label `Unclassified` (discouraged; tracked).
 
 ### Pipeline orchestration and merge
 - **Module**: `insights/pipeline/runner.py`
@@ -76,8 +76,11 @@ Given the approved taxonomy `INCIDENT_TAXONOMY`:
 - `L3` is valid if it is in `INCIDENT_TAXONOMY[L1][L2]`
 
 ### “Uncategorized / invalid L123”
-This must be treated as a **policy decision**, not assumed.
-This document uses the neutral term **L123-invalid** to include:
+Policy decision (confirmed):
+- **Write the exact string `Uncategorized`** into **all three** of `AI_L1`, `AI_L2`, and `AI_L3` when L123 is invalid/missing (do not leave NULLs).
+- This is a deliberate controlled bucket so downstream analytics can separate true taxonomy-path classifications from “unable to classify within taxonomy” cases.
+
+This document uses the term **L123-invalid** to include:
 - NULL/missing values
 - invented labels (not in taxonomy)
 - hierarchy violations (L2 not child of L1, etc.)
@@ -88,13 +91,13 @@ An incident has **path integrity** if:
 - L123 is valid (per above), and
 - L4 is either:
   - a valid L4 category from the derived taxonomy for that incident’s L2/subcategory, or
-  - the explicit fallback `Unclassified_L4` (considered “present but low-signal”), or
+  - the explicit fallback `Unclassified` (considered “present but low-signal”), or
   - NULL with a recorded final reason in `WALLE_L4_NULL_REASONS` (audited missingness)
 
 ## Design overview (two-phase delivery)
 
 ### Phase 1 (implement now, no truncation-limit changes)
-1) Add **hard deterministic validation** for L123 outputs, plus **retry-on-invalid** behavior (modeled after L4’s validity gate).
+1) Add **hard deterministic validation** for L123 outputs, plus **audit + controlled bucket writes** (modeled after L4’s validity gate, but without delaying the main run).
 2) Add a dedicated **remediation workflow** that can re-run L123 and/or L4 on remediation-eligible IDs with safe upsert guardrails.
 3) Expand audit/telemetry tables and metrics so bulk-run failure modes are visible and attributable.
 
@@ -110,7 +113,7 @@ If Phase 1 telemetry demonstrates that invalid/NULL outputs are predominantly du
 ### 1.1 Design intent
 Convert L123 from “prompt-enforced only” to “prompt + code-enforced,” so the system guarantees:
 - no taxonomy drift reaches persisted outputs unless explicitly allowed by policy,
-- invalid outputs are retried deterministically and then routed into remediation,
+- invalid outputs are deterministically **bucketed + audited** and then routed into remediation,
 - end-to-end path completeness is measurable and enforceable.
 
 ### 1.2 New module: `TaxonomyValidator`
@@ -118,7 +121,7 @@ Create a pure-Python validator that:
 - validates and normalizes `(L1, L2, L3)` against `INCIDENT_TAXONOMY`,
 - detects hierarchy violations and swapped levels,
 - returns a structured result used both for:
-  - in-run retry, and
+  - controlled bucketing + auditing, and
   - audit persistence for later remediation.
 
 Proposed contract:
@@ -131,25 +134,42 @@ Proposed contract:
   - `details: dict[str, Any]` (best-effort; never throws)
   - optional `repair_suggestion: dict[str, str] | None` (only if deterministic)
 
-Normalization rules (deterministic only):
+Normalization rules (deterministic, Phase 1):
 - `strip()` whitespace
 - treat empty string / `"None"` / pandas NaN as missing
-- **Do not** introduce fuzzy matching in Phase 1 (avoid assumptions/false positives).
+- allow **case-insensitive** matching
+- allow **bounded canonicalization** so common formatting variants can map to taxonomy labels:
+  - underscores/hyphens/spaces treated equivalently for matching
+  - punctuation ignored for matching
+  - whitespace collapsed
+- allow a **small explicit alias map** for common enterprise variants when needed (example: `VPN Remote Access` → `VPN_RemoteAccess`).
 
-### 1.3 L123 retry-on-invalid
-Add a retry loop similar to L4’s invalid-category retry:
-- If any classification in a batch fails validation:
-  - retry the whole batch with a stricter contract:
-    - model must choose from enumerated allowed values (for that batch) OR return explicit missing markers (policy).
-- After `N` retries:
-  - mark the incident as L123-invalid (for remediation) and persist an audit row.
+Constraint:
+- avoid open-ended “closest string” fuzzy matching that could map to the wrong taxonomy label.
 
-Important:
-- Phase 1 does not change input truncation; retry uses the same truncated fields.
+### 1.3 L123 handling when taxonomy validation fails (Phase 1)
+To avoid delaying the main workflow, **do not retry taxonomy-invalid outputs in-run**.
+
+Instead, after the L123 model returns:
+- validate deterministically against `INCIDENT_TAXONOMY`
+- if invalid/missing/hierarchy violation/swapped-levels suspected:
+  - persist a `WALLE_L123_TAXONOMY_AUDIT` row (1 per `(in_id, walle_run_id)`)
+  - write controlled buckets into the main dataset:
+    - `AI_L1 = "Uncategorized"`
+    - `AI_L2 = "Uncategorized"`
+    - `AI_L3 = "Uncategorized"`
+  - mark the record remediation-eligible (handled by Req 4 workflow)
+
+Notes:
+- this does not remove existing L123 retries for transient API failures (401/429/etc.); those remain
+- Phase 1 does not change prompt truncation limits
 
 ### 1.4 Pipeline-level path integrity gates
 After pipeline merge:
 - If L123-invalid/missing, L4 should be treated as unreliable and remediation-eligible.
+- If `AI_L1/AI_L2/AI_L3` are `Uncategorized`, set:
+  - `AI_L4 = "Unclassified"`
+  - and record an L4 reason indicating the L4 value was a controlled fallback due to invalid L123 (so analytics can separate “blocked-by-policy” vs “pipeline failure”).
 - Persist:
   - L123 audit row (new table) and
   - final L4 missing reason if L4 is missing.
@@ -184,7 +204,7 @@ Bulk-window issues can arise from:
 Phase 1 levers:
 - **Coverage contracts** and “degraded run” classification:
   - L123 validity rate
-  - L4 present rate (including `Unclassified_L4` separately)
+  - L4 present rate (including `Unclassified` separately)
   - L4 missing final reasons breakdown
 - **Fail-loud option** in CI/workflows (policy decision):
   - fail run if coverage below threshold
@@ -244,7 +264,7 @@ Guardrails to implement:
   - L4 remediation updates only L4-related columns
 - **Overwrite rules** (open decision):
   - can remediation overwrite non-null values?
-  - can it overwrite `Unclassified_L4`?
+  - can it overwrite `Unclassified`?
 - **Idempotency**:
   - remediation is safe to re-run; merge keys include `IN_ID` and run metadata is updated deterministically.
 
@@ -266,7 +286,7 @@ Use `INCIDENT_TAXONOMY` and/or `INCIDENT_TAXONOMY_REF` to compute:
 - **Hierarchy violations**: common invalid (L1,L2) / (L2,L3) combinations
 - **Coverage**:
   - % non-null per level (L1–L4)
-  - % `Unclassified_L4` separate from NULL L4
+  - % `Unclassified` separate from NULL L4
 - **Stability / drift**:
   - label entropy and top-share by week/month
 - **Path completeness**:
@@ -299,7 +319,7 @@ If sparse incidents dominate, Phase 2 can consider controlled context expansion 
 - Add `TaxonomyValidator` module
 - Integrate into `L123Classifier.classify_batch` post-processing:
   - validate every returned classification row
-  - if any invalid → retry batch with stricter contract
+  - if invalid/missing → persist an audit row and write `Uncategorized` buckets (no in-run taxonomy retry)
 - Persist audit rows (Snowflake)
 
 ### Step B — Remediation command/workflow
@@ -321,12 +341,12 @@ If sparse incidents dominate, Phase 2 can consider controlled context expansion 
 ## Open decisions (must be answered; do not assume)
 
 1) **What constitutes “uncategorized L123”?**
-   - Is it strictly NULL, or can it be an explicit controlled bucket label?
+   - **DECIDED**: write the exact string `Uncategorized` into each of `AI_L1`, `AI_L2`, and `AI_L3` (instead of NULLs) for invalid/missing L123 outcomes.
    - Are “Other” labels allowed at L2/L3 in taxonomy, and should the model prefer them?
 
 2) **Overwrite policy during remediation**
    - Can remediation overwrite non-null L1/L2/L3/L4?
-   - Can remediation overwrite `Unclassified_L4`?
+   - Can remediation overwrite `Unclassified`?
    - Should remediation be “fill-only” by default?
 
 3) **Fail-loud policy**
