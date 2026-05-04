@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -119,10 +118,12 @@ class ClassificationPipeline:
         batch_size: int | None = None,
         workers: int | None = None,
         debug: bool = False,
+        disable_taxonomy_validation: bool = False,
     ):
         self.batch_size = batch_size or settings.batch_size
         self.workers = workers or settings.workers
         self.debug = debug
+        self.disable_taxonomy_validation = disable_taxonomy_validation
         self.loader = DataLoader()
         self.stats = PipelineStats()
     
@@ -216,6 +217,12 @@ class ClassificationPipeline:
         # Load L123 results and merge
         l123_df = self.loader.load_csv(l123_file)
         if l123_df is not None and not l123_df.empty:
+            # Strip Req 1+3 sidecar columns so they do not propagate into
+            # the final dataset. They are only used between the classifier
+            # and the audit emission step.
+            sidecar_cols = [c for c in l123_df.columns if c.startswith("_validation") or c.startswith("_original_l") or c == "_repair_applied"]
+            if sidecar_cols:
+                l123_df = l123_df.drop(columns=sidecar_cols, errors="ignore")
             # Rename L123 columns with ai_l1/l2/l3 naming
             l123_rename = {
                 'category': 'ai_l1',
@@ -264,11 +271,17 @@ class ClassificationPipeline:
             combined_l4_df = pd.concat(all_l4_dfs, ignore_index=True)
             logger.debug(f"Combined L4 df: {len(combined_l4_df)} records")
             
-            #Clean up invalid L4 categories - but keep Unclassified_L4 (it's a valid classification)
-            #Only remve truly invalid categories the model invents
+            # Clean up invalid L4 categories - but KEEP Unclassified (it's a valid classification)
+            # Only remove truly invalid categories the model invents
             if 'l4_category' in combined_l4_df.columns:
-                #Note: Do NOT remove "unclassified_l4" - it's a valid category indicating insufficeint info
-                #Only remove invented categories like "insufficient_information", "unknown", etc.
+                # Normalize any legacy "Unclassified_L4" rows (from older runs) to canonical "Unclassified"
+                legacy_mask = combined_l4_df['l4_category'].astype(str).str.lower() == 'unclassified_l4'
+                if legacy_mask.any():
+                    combined_l4_df.loc[legacy_mask, 'l4_category'] = 'Unclassified'
+                    logger.info(f"Normalized {int(legacy_mask.sum())} legacy 'Unclassified_L4' rows to 'Unclassified'")
+
+                # Note: Do NOT remove "unclassified" - it's a valid category indicating insufficient info
+                # Only remove invented categories like "insufficient_information", "unknown", etc.
                 invalid_pattern = r'^(insufficient|unknown|missing|unable_to_classify|pending_details|n/a|none)$|insufficient_|_unknown$|_missing$'
                 invalid_mask = combined_l4_df['l4_category'].str.lower().str.match(invalid_pattern, na=False)
                 invalid_count = invalid_mask.sum()
@@ -284,12 +297,12 @@ class ClassificationPipeline:
                             pass
                     # Set invalid categories to None - they will show as blank
                     combined_l4_df.loc[invalid_mask, 'l4_category'] = None
-                    logger.info(f"Removed {invalid_count} invalid L4 categories (not Unclassified_L4)")
-                
-                # Log Unclassified_L4 count for monitoring
-                unclassified_count = (combined_l4_df['l4_category'].str.lower() == 'unclassified_l4').sum()
+                    logger.info(f"Removed {invalid_count} invalid L4 categories (not Unclassified)")
+
+                # Log Unclassified count for monitoring
+                unclassified_count = (combined_l4_df['l4_category'].str.lower() == 'unclassified').sum()
                 total_count = len(combined_l4_df)
-                logger.info(f"L4 Classification: {total_count - unclassified_count}/{total_count} ({100*(total_count - unclassified_count)/total_count:.1f}%) classified, {unclassified_count} ({100*unclassified_count/total_count:.1f}%) Unclassified_L4")
+                logger.info(f"L4 Classification: {total_count - unclassified_count}/{total_count} ({100*(total_count - unclassified_count)/total_count:.1f}%) classified, {unclassified_count} ({100*unclassified_count/total_count:.1f}%) Unclassified")
             
             # Rename L4 columns with ai_l4 prefix
             l4_rename = {
@@ -362,8 +375,10 @@ class ClassificationPipeline:
         # Final-state AI_L4 NULL logging (one row per incident whose AI_L4 is missing)
         try:
             from ..utils.l4_null_logging import L4NullRow, record_l4_nulls
+            import pandas as pd
 
             def _is_missing_l4(v) -> bool:
+                # pandas often represents missing strings as NaN, not None
                 if v is None or pd.isna(v):
                     return True
                 s = str(v).strip()
@@ -484,6 +499,7 @@ class ClassificationPipeline:
             batch_size=self.batch_size,
             workers=self.workers,
             debug=self.debug,
+            disable_taxonomy_validation=self.disable_taxonomy_validation,
         )
         
         # Run classification
@@ -497,7 +513,14 @@ class ClassificationPipeline:
                 checkpoint_file,
                 valid_results,
             )
-        
+
+        # Emit L123 taxonomy audit rows for any non-`valid` outcomes
+        # produced in this invocation (Req 1+3). Best-effort; never raises.
+        try:
+            self._emit_l123_audit(valid_results)
+        except Exception as exc:
+            logger.warning("L123 audit emission failed (non-fatal): %s", exc)
+
         # Update stats
         self.stats.l123_processed += len(results)
         self.stats.l123_success = already_processed + len(valid_results)
@@ -506,6 +529,172 @@ class ClassificationPipeline:
         logger.info(f"L123: Classified {len(valid_results)}/{len(incidents)} ({self.stats.l123_success} total success)")
         
         return checkpoint_file
+
+    def _emit_l123_audit(self, results: list[dict[str, Any]]) -> None:
+        """Build and persist L123 audit rows for a batch of classifier results.
+
+        Only rows whose `_validation_status` is NOT `valid` are persisted.
+        `valid_after_repair` rows ARE persisted so we can track the impact
+        of the alias map / normalization. Rows missing the sidecar field
+        (e.g., produced by an older classifier or with the validator
+        disabled) are skipped.
+        """
+        if not results:
+            return
+        if not getattr(settings, "l123_audit_persist", True):
+            logger.info("L123 audit persistence disabled by settings; skipping")
+            return
+
+        from ..utils.l123_audit_logging import L123AuditRow, record_l123_audit
+        from ..utils import get_run_id
+
+        run_id = get_run_id()
+
+        rows: list[L123AuditRow] = []
+        for r in results:
+            status = r.get("_validation_status")
+            if not status or status == "valid":
+                continue
+            in_id = (
+                r.get("incident_id")
+                or r.get("in_id")
+                or r.get("Incident ID")
+            )
+            if not in_id:
+                continue
+            details: dict[str, Any] | None = None
+            details_raw = r.get("_validation_details")
+            if isinstance(details_raw, str) and details_raw:
+                try:
+                    import json as _json
+
+                    details = _json.loads(details_raw)
+                except Exception:
+                    details = {"raw": details_raw}
+
+            rows.append(
+                L123AuditRow(
+                    in_id=str(in_id),
+                    walle_run_id=run_id,
+                    status=status,
+                    original_l1=r.get("_original_l1"),
+                    original_l2=r.get("_original_l2"),
+                    original_l3=r.get("_original_l3"),
+                    final_l1=r.get("category"),
+                    final_l2=r.get("subcategory"),
+                    final_l3=r.get("product"),
+                    repair_applied=bool(r.get("_repair_applied")),
+                    details=details,
+                )
+            )
+
+        if not rows:
+            return
+
+        record_l123_audit(
+            rows,
+            persist_to_snowflake=getattr(settings, "l123_audit_persist", True),
+            table_name=getattr(
+                settings, "l123_audit_table", "WALLE_L123_TAXONOMY_AUDIT"
+            ),
+        )
+
+    def _build_uncategorized_l4_checkpoint(
+        self,
+        uncategorized_df,
+        id_col: str,
+    ) -> str:
+        """Synthesize an L4 checkpoint for the L123-Uncategorized cohort.
+
+        Each row gets `l4_category = "Unclassified"` plus stub values for
+        the other L4 fields. The checkpoint is written to the standard
+        checkpoint directory and its path is returned so it can be added
+        to `l4_outputs` and picked up by the normal final merge.
+
+        Also emits one `WALLE_L4_NULL_REASONS` row per incident with
+        reason `l123_invalid_blocks_l4` so analytics can separate
+        blocked-by-policy from pipeline-failure cohorts.
+        """
+        import pandas as pd
+
+        if uncategorized_df is None or uncategorized_df.empty:
+            return ""
+
+        ids = uncategorized_df[id_col].astype(str).tolist()
+        synth_rows = []
+        for in_id in ids:
+            synth_rows.append(
+                {
+                    "incident_id": in_id,
+                    "l4_category": "Unclassified",
+                    "l4_subcategory": None,
+                    "l4_confidence": 0.0,
+                    "resolution_action": "Not attempted (L123 was Uncategorized)",
+                    "is_actionable": False,
+                    "actionability_reason": (
+                        "L123 classification was Uncategorized; L4 not attempted "
+                        "by design (Req 1+3 path integrity)"
+                    ),
+                    "l4_rationale": "l123_invalid_blocks_l4",
+                }
+            )
+        synth_df = pd.DataFrame(synth_rows)
+
+        checkpoint_path = settings.checkpoint_dir / "l4_uncategorized_synthetic_checkpoint.csv"
+        # Deduplicate against any existing rows in this run so resume is safe
+        if checkpoint_path.exists():
+            try:
+                existing = pd.read_csv(checkpoint_path)
+                if "incident_id" in existing.columns:
+                    existing_ids = set(existing["incident_id"].astype(str).tolist())
+                    synth_df = synth_df[~synth_df["incident_id"].astype(str).isin(existing_ids)]
+                    if not synth_df.empty:
+                        combined = pd.concat([existing, synth_df], ignore_index=True)
+                    else:
+                        combined = existing
+                else:
+                    combined = synth_df
+            except Exception:
+                combined = synth_df
+        else:
+            combined = synth_df
+
+        combined.to_csv(checkpoint_path, index=False)
+
+        # Emit WALLE_L4_NULL_REASONS rows with the new reason code.
+        try:
+            from ..utils.l4_null_logging import L4NullRow, record_l4_nulls
+            from ..utils import get_run_id
+
+            run_id = get_run_id()
+            null_rows: list[L4NullRow] = []
+            for in_id in ids:
+                null_rows.append(
+                    L4NullRow(
+                        in_id=str(in_id),
+                        reason="l123_invalid_blocks_l4",
+                        cause=(
+                            "L123 classification was Uncategorized; L4 not attempted "
+                            "by design (Req 1+3 path integrity)"
+                        ),
+                        subcategory="Uncategorized",
+                        walle_run_id=run_id,
+                        original_value=None,
+                    )
+                )
+            if null_rows:
+                record_l4_nulls(
+                    null_rows,
+                    persist_to_snowflake=True,
+                    log_each_incident=False,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record l123_invalid_blocks_l4 reasons (non-fatal): %s",
+                exc,
+            )
+
+        return str(checkpoint_path)
     
     async def _run_l4(
         self,
@@ -589,6 +778,43 @@ class ClassificationPipeline:
                 category_col = col
                 break
         
+        # === Pre-L4 path-integrity gate (Req 1+3) ===
+        # Incidents whose L123 result was bucketed to "Uncategorized" must
+        # NOT be sent to L4 classification — they have no valid subcategory
+        # the L4 model can classify under. We synthesize an L4 checkpoint
+        # for this cohort with `l4_category = "Unclassified"` and emit
+        # `WALLE_L4_NULL_REASONS` rows with reason `l123_invalid_blocks_l4`.
+        uncategorized_synthetic_checkpoint: str | None = None
+        if subcategory_col is not None:
+            try:
+                uncategorized_mask = df[subcategory_col].astype(str) == "Uncategorized"
+            except Exception:
+                uncategorized_mask = None  # type: ignore[assignment]
+            if uncategorized_mask is not None and bool(uncategorized_mask.any()):
+                uncategorized_df = df[uncategorized_mask].copy()
+                df = df[~uncategorized_mask].copy()
+                try:
+                    uncategorized_synthetic_checkpoint = self._build_uncategorized_l4_checkpoint(
+                        uncategorized_df,
+                        id_col=l123_id_col,
+                    )
+                    print(
+                        f"[L4] Pre-L4 gate: routed {len(uncategorized_df):,} "
+                        f"Uncategorized-L123 incidents to ai_l4='Unclassified'"
+                    )
+                    logger.info(
+                        "Pre-L4 path-integrity gate: %d incidents bucketed to Unclassified "
+                        "(reason=l123_invalid_blocks_l4)",
+                        len(uncategorized_df),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Pre-L4 path-integrity gate failed (non-fatal): %s; "
+                        "Uncategorized cohort will fall through to standard flow",
+                        exc,
+                    )
+                    uncategorized_synthetic_checkpoint = None
+
         # Determine subcategories to process
         if subcategories:
             target_subcats = subcategories
@@ -596,6 +822,8 @@ class ClassificationPipeline:
             # Get all unique subcategories
             if subcategory_col:
                 target_subcats = df[subcategory_col].dropna().unique().tolist()
+                # Defensive: never include the controlled Uncategorized bucket
+                target_subcats = [s for s in target_subcats if str(s) != "Uncategorized"]
                 print(f"[L4] Found {len(target_subcats)} unique subcategories in '{subcategory_col}' column")
             else:
                 print("[L4] Warning: No subcategory column found, treating as single group")
@@ -631,6 +859,10 @@ class ClassificationPipeline:
         
         # Shared state for results
         l4_outputs: dict[str, str] = {}
+        # Seed l4_outputs with the synthetic Uncategorized checkpoint so the
+        # standard final merge picks up these rows (Req 1+3 path integrity).
+        if uncategorized_synthetic_checkpoint:
+            l4_outputs["_uncategorized_synthetic"] = uncategorized_synthetic_checkpoint
         results_lock = asyncio.Lock()
         stats_lock = asyncio.Lock()
         
@@ -806,6 +1038,7 @@ async def run_full_pipeline(
     generate_taxonomy: bool = False,
     taxonomy_days: int = 7,
     max_rpm: int = 550,
+    disable_taxonomy_validation: bool = False,
 ) -> PipelineResult:
     """
     Convenience function to run the full classification pipeline.
@@ -834,6 +1067,7 @@ async def run_full_pipeline(
         batch_size=batch_size,
         workers=workers,
         debug=debug,
+        disable_taxonomy_validation=disable_taxonomy_validation,
     )
     
     return await pipeline.run(
