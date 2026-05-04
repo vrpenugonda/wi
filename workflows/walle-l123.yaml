@@ -50,6 +50,10 @@ on:
 env:
   PYTHON_VERSION: "3.12"
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   l123-classify:
     name: L123 Worker ${{ matrix.worker }}
@@ -62,7 +66,24 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      # - name: configure jfrog saas
+      #   id: jf-saas-setup
+      #   uses: uhg-pipelines/epl-jf/configure-saas-connection@v4
+      #   with:
+      #     jfrog-project-key: nsis-aiml-initiatives
+      #     pip-setup: true
 
+
+      - name: Get Artifactory Access Token
+        id: setup-jfrog-saas
+        uses: uhg-pipelines/epl-jf/saas-setup@v4 #uhg-pipelines/epl-jf/configure-saas-connection@v4    
+        with:
+          jfrog-project-key: nsis-aiml-initiatives
+          pip-setup: true
+          apt-setup: true
+
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -81,7 +102,7 @@ jobs:
           ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
         run: |
           rm -f $HOME/.netrc 2>/dev/null || true
-          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "machine centraluhg.jfrog.io" > $HOME/.netrc
           echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
           echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
           chmod 600 $HOME/.netrc
@@ -92,7 +113,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv sync --frozen
@@ -104,7 +125,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           echo "Attempt 1 failed, retrying in 15s..."
           sleep 15
@@ -117,7 +138,7 @@ jobs:
         shell: bash
         timeout-minutes: 5
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           echo "Attempt 2 failed, retrying in 30s..."
           sleep 30
@@ -259,7 +280,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      # - name: configure jfrog saas
+      #   id: jf-saas-setup
+      #   uses: uhg-pipelines/epl-jf/configure-saas-connection@v4
+      #   with:
+      #     jfrog-project-key: nsis-aiml-initiatives
+      #     pip-setup: true
 
+
+      - name: Get Artifactory Access Token
+        id: setup-jfrog-saas
+        uses: uhg-pipelines/epl-jf/saas-setup@v4 #uhg-pipelines/epl-jf/configure-saas-connection@v4    
+        with:
+          jfrog-project-key: nsis-aiml-initiatives
+          pip-setup: true
+          apt-setup: true
+ 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -278,7 +315,7 @@ jobs:
           ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
         run: |
           rm -f $HOME/.netrc 2>/dev/null || true
-          echo "machine edgeinternal1uhg.uhg.com" > $HOME/.netrc
+          echo "machine centraluhg.jfrog.io" > $HOME/.netrc
           echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
           echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
           chmod 600 $HOME/.netrc
@@ -289,7 +326,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           uv sync --frozen
@@ -301,7 +338,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           echo "Attempt 1 failed, retrying in 15s..."
           sleep 15
@@ -314,7 +351,7 @@ jobs:
         shell: bash
         timeout-minutes: 5
         env:
-          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@edgeinternal1uhg.uhg.com/artifactory/api/pypi/docx-pypi-vir/simple
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
         run: |
           echo "Attempt 2 failed, retrying in 30s..."
           sleep 30

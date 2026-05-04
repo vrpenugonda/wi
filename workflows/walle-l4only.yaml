@@ -1,0 +1,159 @@
+name: WALLE - L4 Only Backfill (Snowflake missing AI_L4 - Existing Incidents)
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD). Required."
+        required: true
+        type: string
+      end_date:
+        description: "End date (YYYY-MM-DD). Required."
+        required: true
+        type: string
+      subcategories:
+        description: "Optional: space-separated subcategories (e.g. 'VPN_RemoteAccess Hardware')"
+        required: false
+        type: string
+        default: ""
+      max_rpm:
+        description: "Max requests per minute for L4 (default: 550)"
+        required: false
+        type: number
+        default: 550
+      env:
+        description: "Target environment"
+        required: false
+        type: choice
+        options: [dev, stage, prod]
+        default: prod
+concurrency:
+  group: walle-l4-only-backfill
+  cancel-in-progress: false
+env:
+  PYTHON_VERSION: "3.12"
+  
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  l4_only_backfill:
+    name: L4-only backfill
+    runs-on: uhg-runner
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # - name: configure jfrog saas
+      #   id: jf-saas-setup
+      #   uses: uhg-pipelines/epl-jf/configure-saas-connection@v4
+      #   with:
+      #     jfrog-project-key: nsis-aiml-initiatives
+      #     pip-setup: true
+
+
+      - name: Get Artifactory Access Token
+        id: setup-jfrog-saas
+        uses: uhg-pipelines/epl-jf/saas-setup@v4 #uhg-pipelines/epl-jf/configure-saas-connection@v4    
+        with:
+          jfrog-project-key: nsis-aiml-initiatives
+          pip-setup: true
+          apt-setup: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure PyPI authentication
+        shell: bash
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.ENTERPRISE_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ENTERPRISE_TOKEN }}
+        run: |
+          rm -f $HOME/.netrc 2>/dev/null || true
+          echo "machine centraluhg.jfrog.io" > $HOME/.netrc
+          echo "login ${ARTIFACTORY_USERNAME}" >> $HOME/.netrc
+          echo "password ${ARTIFACTORY_PASSWORD}" >> $HOME/.netrc
+          chmod 600 $HOME/.netrc
+
+      - name: Install dependencies
+        shell: bash
+        timeout-minutes: 10
+        env:
+          UV_INDEX_URL: https://${{ secrets.ENTERPRISE_USERNAME }}:${{ secrets.ENTERPRISE_TOKEN }}@centraluhg.jfrog.io/artifactory/api/pypi/docx-pypi-vir/simple
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+
+      - name: Run L4-only backfill
+        env:
+          # Azure / auth (required for L4 calls)
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_DEPLOYMENT: ${{ secrets.AZURE_DEPLOYMENT }}
+          API_VERSION: ${{ secrets.API_VERSION }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          SCOPE: ${{ secrets.SCOPE }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          X_UPSTREAM_ENV: ${{ inputs.env == 'prod' && 'prod' || 'nonprod' }}
+          
+          
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+          SNOWFLAKE_TABLE: ${{ secrets.SNOWFLAKE_TABLE || 'WALLE_CLASSIFIED_INCIDENTS' }}
+          
+          
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL || 'https://s3api-core.optum.com' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          START_DATE="${{ inputs.start_date }}"
+          END_DATE="${{ inputs.end_date }}"
+          SUBCATEGORIES_INPUT="${{ inputs.subcategories }}"
+          MAX_RPM="${{ inputs.max_rpm }}"
+          echo "Starting L4-only backfill"
+          echo "  start_date=${START_DATE}"
+          echo "  end_date=${END_DATE}"
+          echo "  subcategories=${SUBCATEGORIES_INPUT:-<all>}"
+          echo "  max_rpm=${MAX_RPM}"
+          SUBCAT_ARGS=()
+          if [[ -n "${SUBCATEGORIES_INPUT}" ]]; then
+            read -r -a SUBCAT_LIST <<< "${SUBCATEGORIES_INPUT}"
+            SUBCAT_ARGS=(--subcategories "${SUBCAT_LIST[@]}")
+          fi
+          uv run python -m insights run \
+            --l4-only \
+            --start-date "${START_DATE}" \
+            --end-date "${END_DATE}" \
+            --max-rpm "${MAX_RPM}" \
+            "${SUBCAT_ARGS[@]}"
+
+      - name: Upload outputs/logs (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l4-only-backfill-${{ github.run_id }}
+          path: |
+            logs/
+            data/output/
+            data/checkpoints/
+            data/taxonomies/
+          retention-days: 7

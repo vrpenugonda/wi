@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       minutes_back:
-        description: "Minutes of data to process (default: 120)"
+        description: "Minutes of data to process (default: 360)"
         required: false
         type: number
-        default: 120
+        default: 360
       days_back:
         description: "Days of data to process (overrides minutes_back)"
         required: false
@@ -55,10 +55,20 @@ on:
 
 # Prevent overlapping runs - scheduled runs cancel previous scheduled runs,
 # but manual runs are allowed to complete
+
+# concurrency:
+#   group: walle-pipeline-${{ github.event_name }}
+#   cancel-in-progress: ${{ github.event_name == 'schedule' }}
+
 concurrency:
-  group: walle-pipeline-${{ github.event_name }}
+  group: "${{ github.event_name == 'schedule'  && 'walle-pipeline-schedule' || format('walle-pipeline-manual-{0}', github.run_id) }}"
   cancel-in-progress: ${{ github.event_name == 'schedule' }}
 
+
+permissions:
+  contents: read
+  id-token: write
+  
 env:
   PYTHON_VERSION: "3.12"
 
@@ -67,7 +77,7 @@ jobs:
     name: Prepare Data
     uses: ./.github/workflows/walle-prepare.yaml
     with:
-      minutes_back: ${{ github.event.inputs.minutes_back && fromJSON(github.event.inputs.minutes_back) || 120 }}
+      minutes_back: ${{ github.event.inputs.minutes_back && fromJSON(github.event.inputs.minutes_back) || 360 }}
       days_back: ${{ github.event.inputs.days_back && fromJSON(github.event.inputs.days_back) || 0 }}
       start_date: ${{ github.event.inputs.start_date || '' }}
       end_date: ${{ github.event.inputs.end_date || '' }}
@@ -100,11 +110,26 @@ jobs:
       needs.prepare.outputs.record_count != '0' &&
       (github.event_name == 'schedule' || github.event.inputs.skip_l4 != 'true') &&
       (needs.l123.result == 'success' || needs.l123.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: uhg-runner
     outputs:
       l4_matrix: ${{ steps.matrix.outputs.l4_matrix }}
       has_subcategories: ${{ steps.matrix.outputs.has_subcategories }}
     steps:
+      # - name: configure jfrog saas
+      #   id: jf-saas-setup
+      #   uses: uhg-pipelines/epl-jf/configure-saas-connection@v4
+      #   with:
+      #     jfrog-project-key: nsis-aiml-initiatives
+      #     pip-setup: true
+
+      - name: Get Artifactory Access Token
+        id: setup-jfrog-saas
+        uses: uhg-pipelines/epl-jf/saas-setup@v4 #uhg-pipelines/epl-jf/configure-saas-connection@v4    
+        with:
+          jfrog-project-key: nsis-aiml-initiatives
+          pip-setup: true
+          apt-setup: true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
