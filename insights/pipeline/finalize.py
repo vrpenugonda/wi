@@ -123,6 +123,71 @@ def discover_csv_files(artifacts_dir: str | Path) -> dict[str, list[str]]:
     return categories
 
 
+def _emit_final_l4_null_audit(final_file: Path, run_id: str) -> None:
+    """Scan the finalized merged CSV for missing ai_l4 and persist
+    `WALLE_L4_NULL_REASONS` rows.
+
+    Mirrors the unified runner's logic in
+    ``insights/pipeline/runner.py`` lines 375-429 so the decomposed
+    GitHub-Actions path produces the same audit output as ``walle run``.
+
+    Reason categorization (CI path only):
+
+    - All missing-``ai_l4`` rows: ``reason="l4_missing_after_l4_run"``.
+      The ``l4_invalid_category_cleaned`` distinction lives inside the
+      per-subcategory ``walle l4`` workers and is not currently surfaced
+      to finalize. That's a Phase-2 enhancement (L4 sidecar artifact).
+
+    Best-effort: ``record_l4_nulls`` already auto-creates the target
+    table and swallows Snowflake errors with a warning, so this helper
+    never raises into the caller under normal operation.
+    """
+    from insights.utils.l4_null_logging import L4NullRow, record_l4_nulls
+
+    if not final_file.exists():
+        return
+    df = pd.read_csv(final_file)
+    if "in_id" not in df.columns:
+        return
+
+    def _is_missing(v: Any) -> bool:
+        if v is None or pd.isna(v):
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() == "none"
+
+    if "ai_l4" not in df.columns:
+        missing_mask = df["in_id"].apply(lambda _: True)
+    else:
+        missing_mask = df["ai_l4"].apply(_is_missing)
+
+    null_rows: list[L4NullRow] = []
+    for _, r in df.loc[missing_mask].iterrows():
+        in_id = str(r.get("in_id") or "").strip()
+        if not in_id:
+            continue
+        subcat = r.get("ai_l2")
+        null_rows.append(
+            L4NullRow(
+                in_id=in_id,
+                reason="l4_missing_after_l4_run",
+                cause="ai_l4_missing_in_final_merge",
+                subcategory=(
+                    str(subcat)
+                    if subcat is not None and not pd.isna(subcat)
+                    else None
+                ),
+                walle_run_id=run_id,
+            )
+        )
+
+    if not null_rows:
+        print(f"[L4-NULL] no missing-ai_l4 rows for run_id={run_id}")
+        return
+
+    record_l4_nulls(null_rows, persist_to_snowflake=True, log_each_incident=False)
+
+
 def _load_l123_merged(files: list[str]) -> pd.DataFrame | None:
     """Load and deduplicate L123 merged file(s)."""
     print(f"\nLoading L123 merged file(s) (preferred - has original columns)...")
@@ -510,6 +575,15 @@ def run_finalize(
     sf_status = sf_result.get("success", False) if isinstance(sf_result, dict) else sf_result
     print(f"  Snowflake: {sf_status}")
     print("=" * 42)
+
+    # Final-state AI_L4 NULL audit (parity with ClassificationPipeline.run()
+    # in insights/pipeline/runner.py lines 375-429). Best-effort: never fail
+    # the workflow on audit hiccups - the main-table upload above is the
+    # source of truth for finalize's exit status.
+    try:
+        _emit_final_l4_null_audit(output_file, run_id)
+    except Exception as exc:
+        print(f"AI_L4 NULL final-reason logging failed (non-fatal): {exc}")
 
     # Write stats file alongside output
     stats_file = output_file.parent / "merge_stats.json"
