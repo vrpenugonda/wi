@@ -104,6 +104,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="Maximum requests per minute limit (default: 550)",
     )
     run_parser.add_argument(
+        "--disable-taxonomy-validation",
+        action="store_true",
+        help="Disable Req 1+3 L123 taxonomy validation/repair/audit (kill switch)",
+    )
+    run_parser.add_argument(
         "--skip-l123",
         action="store_true",
         help="Skip L123 classification (use existing)",
@@ -474,6 +479,7 @@ async def cmd_run(args):
         generate_taxonomy=args.generate_taxonomy,
         taxonomy_days=args.taxonomy_days,
         max_rpm=args.max_rpm,
+        disable_taxonomy_validation=getattr(args, "disable_taxonomy_validation", False),
     )
     
     print(f"\nPipeline completed with status: {result.status.value}")
