@@ -121,11 +121,11 @@ class L4Classifier(BaseClassifier):
         ])
         
         # Add the fallback Unknown category - but discourage its use
-        taxonomy_str += "\n- Unclassified_L4: LAST RESORT ONLY - Use when ticket is truly empty, a ghost call, or completely unintelligible. (examples: blank ticket, ghost call, single word with no context) [Actionable: False]"
+        taxonomy_str += "\n- Unclassified: LAST RESORT ONLY - Use when ticket is truly empty, a ghost call, or completely unintelligible. (examples: blank ticket, ghost call, single word with no context) [Actionable: False]"
         
         # Get valid category names for reference (include fallback)
         valid_category_names = [cat.name for cat in self._taxonomy.categories]
-        valid_category_names.append("Unclassified_L4")
+        valid_category_names.append("Unclassified")
         
         subcategory_context = self._taxonomy.subcategory or "General"
         
@@ -143,7 +143,7 @@ CLASSIFICATION PHILOSOPHY - BE INCLUSIVE:
 - Use the application name, error type, or action taken to guide classification
 - If an app name is mentioned (e.g., "COSMOS", "EEMS", "Facets"), use the app-specific category or a General category
 - If a resolution describes a specific action, classify based on that action
-- Low confidence classifications (0.3-0.5) are BETTER than Unclassified_L4
+- Low confidence classifications (0.3-0.5) are BETTER than Unclassified
 - When in doubt, pick the category that MOST CLOSELY matches the issue domain
 
 CRITICAL RULES:
@@ -158,13 +158,13 @@ CRITICAL RULES:
 9. is_actionable: Use the category's defined actionability
 10. l4_rationale: REQUIRED - Explain your reasoning and which clues led to this category choice
 
-WHEN TO USE "Unclassified_L4" - STRICT CRITERIA (use sparingly, <15% of tickets):
+WHEN TO USE "Unclassified" - STRICT CRITERIA (use sparingly, <15% of tickets):
 - Ticket is COMPLETELY EMPTY or just punctuation
 - Ghost call / hang-up with absolutely no other information
 - Single unintelligible word with no context whatsoever
 - Ticket explicitly says "test" or "ignore" with nothing else
 
-DO NOT USE Unclassified_L4 when:
+DO NOT USE Unclassified when:
 - An application name is mentioned (use app-specific or General category)
 - Any action was taken (classify by the action type)
 - Any error message or symptom is described
@@ -580,7 +580,7 @@ Total population: {population:,}
                     if hasattr(batch_result, "classifications") and batch_result.classifications:
                         # Get valid category names (lowercase for comparison) - include fallback
                         valid_categories = {cat.name.lower() for cat in self._taxonomy.categories} if self._taxonomy else set()
-                        valid_categories.add('unclassified_l4')  # Always allow the fallback category
+                        valid_categories.add('unclassified')  # Always allow the fallback category
                         
                         # Check all classifications for validity
                         valid_classifications = []
@@ -595,18 +595,23 @@ Total population: {population:,}
                             # Check if the l4_category is valid
                             l4_cat = classification.get('l4_category', '').lower()
                             
-                            # Allow our official "Unclassified_L4" fallback category
-                            if l4_cat == 'unclassified_l4':
+                            # Allow our official "Unclassified" fallback category
+                            if l4_cat == 'unclassified':
                                 valid_classifications.append(classification)
                                 continue
                             
                             # Reject any category containing these substrings (model invents many variations)
-                            # Note: "unclassified_l4" is allowed above, but other variations like "unclassified" are not
+                            # Note: "unclassified" is allowed above; legacy "unclassified_l4" is normalized below
                             invalid_substrings = ['insufficient', 'unknown', 'missing', 'unable_to_classify', 'pending_details', 'n/a', 'none']
                             is_invalid = any(sub in l4_cat for sub in invalid_substrings)
                             
-                            # Reject "unclassified" unless it's exactly "unclassified_l4"
-                            if 'unclassif' in l4_cat and l4_cat != 'unclassified_l4':
+                            # Normalize legacy "unclassified_l4" to the canonical "unclassified".
+                            # Anything else with "unclassif" but not exactly "unclassified" is invalid.
+                            if l4_cat == 'unclassified_l4':
+                                classification['l4_category'] = 'Unclassified'
+                                valid_classifications.append(classification)
+                                continue
+                            if 'unclassif' in l4_cat and l4_cat != 'unclassified':
                                 is_invalid = True
                             
                             # Also invalid if not in the valid taxonomy categories

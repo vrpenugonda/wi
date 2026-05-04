@@ -6,6 +6,7 @@ using the hierarchical taxonomy defined in models/taxonomy.py.
 """
 
 import asyncio
+import logging
 from typing import Any
 
 from pydantic_ai import Agent
@@ -16,7 +17,10 @@ from ..models import (
     BatchIncidentClassification,
 )
 from ..utils import get_azure_ad_token
+from ..validation import TaxonomyValidator
 from .base import BaseClassifier
+
+logger = logging.getLogger(__name__)
 
 
 def get_taxonomy_description() -> str:
@@ -49,6 +53,7 @@ class L123Classifier(BaseClassifier):
         workers: int | None = None,
         debug: bool = False,
         max_rpm: int = 550,
+        disable_taxonomy_validation: bool = False,
     ):
         super().__init__(
             batch_size=batch_size or settings.batch_size,
@@ -59,6 +64,32 @@ class L123Classifier(BaseClassifier):
         self._agent: Agent[None, BatchIncidentClassification] | None = None
         self._token: str | None = None
         self._taxonomy_desc = get_taxonomy_description()
+
+        validation_enabled = (
+            getattr(settings, "enable_l123_taxonomy_validation", True)
+            and not disable_taxonomy_validation
+        )
+        self._validator: TaxonomyValidator | None = None
+        if validation_enabled:
+            try:
+                self._validator = TaxonomyValidator.from_files(
+                    taxonomy=INCIDENT_TAXONOMY,
+                    alias_map_path=getattr(
+                        settings,
+                        "l123_alias_map_path",
+                        "insights/validation/aliases.json",
+                    ),
+                )
+                logger.info("L123 taxonomy validator: enabled")
+            except Exception as exc:
+                logger.warning(
+                    "L123 taxonomy validator construction failed (%s); "
+                    "continuing without validation",
+                    exc,
+                )
+                self._validator = None
+        else:
+            logger.info("L123 taxonomy validator: disabled")
     
     async def _ensure_agent(self) -> Agent[None, BatchIncidentClassification]:
         """Create or refresh the classification agent."""
@@ -217,7 +248,7 @@ INCIDENTS:
                             if hasattr(c, 'incident_id') and c.incident_id
                         ]
                         if valid_classifications:
-                            return valid_classifications
+                            return self._apply_taxonomy_validation(valid_classifications)
                 
                 # Empty response - treat as error and retry
                 if self.debug:
@@ -260,6 +291,67 @@ INCIDENTS:
         
         return []
     
+    def _apply_taxonomy_validation(
+        self,
+        classifications: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Run each classification through the taxonomy validator (Req 1+3).
+
+        Replaces `category`, `subcategory`, `product` with either canonical
+        taxonomy labels (possibly after deterministic repair) or the
+        controlled bucket "Uncategorized" for all three levels.
+
+        Attaches sidecar fields (`_validation_status`, `_original_l1/l2/l3`,
+        `_repair_applied`, `_validation_details`) used by the pipeline
+        runner to emit `WALLE_L123_TAXONOMY_AUDIT` rows. These sidecar
+        fields are stripped before the final merge into
+        `WALLE_CLASSIFIED_INCIDENTS`.
+
+        If the validator is disabled (kill switch or construction failed),
+        the input list is returned unchanged.
+        """
+        if self._validator is None:
+            return classifications
+
+        enriched: list[dict[str, Any]] = []
+        for c in classifications:
+            try:
+                vr = self._validator.validate(
+                    c.get("category"),
+                    c.get("subcategory"),
+                    c.get("product"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "L123 validator unexpected failure on incident %s: %s",
+                    c.get("incident_id"),
+                    exc,
+                )
+                enriched.append(c)
+                continue
+
+            c["category"] = vr.final_l1
+            c["subcategory"] = vr.final_l2
+            c["product"] = vr.final_l3
+            c["_validation_status"] = vr.status
+            c["_original_l1"] = vr.original_l1
+            c["_original_l2"] = vr.original_l2
+            c["_original_l3"] = vr.original_l3
+            c["_repair_applied"] = vr.repair_applied
+            try:
+                import json as _json
+
+                c["_validation_details"] = (
+                    _json.dumps(vr.details, ensure_ascii=False, default=str)
+                    if vr.details
+                    else None
+                )
+            except Exception:
+                c["_validation_details"] = None
+            enriched.append(c)
+
+        return enriched
+
     async def classify_single(
         self,
         incident: dict[str, Any],
@@ -348,7 +440,49 @@ async def run_l123_classification(
     valid_results = [r for r in results if r]
     if valid_results:
         loader.append_results(checkpoint_file, valid_results)
-    
+
+    # Best-effort: emit Req 1+3 audit rows for non-`valid` outcomes so the
+    # standalone l123 CLI command stays consistent with the full pipeline.
+    try:
+        if getattr(settings, "l123_audit_persist", True):
+            from ..utils.l123_audit_logging import L123AuditRow, record_l123_audit
+            from ..utils import get_run_id
+
+            run_id = get_run_id()
+            audit_rows: list[L123AuditRow] = []
+            for r in valid_results:
+                status = r.get("_validation_status")
+                if not status or status == "valid":
+                    continue
+                in_id = r.get("incident_id") or r.get("in_id")
+                if not in_id:
+                    continue
+                audit_rows.append(
+                    L123AuditRow(
+                        in_id=str(in_id),
+                        walle_run_id=run_id,
+                        status=status,
+                        original_l1=r.get("_original_l1"),
+                        original_l2=r.get("_original_l2"),
+                        original_l3=r.get("_original_l3"),
+                        final_l1=r.get("category"),
+                        final_l2=r.get("subcategory"),
+                        final_l3=r.get("product"),
+                        repair_applied=bool(r.get("_repair_applied")),
+                    )
+                )
+            if audit_rows:
+                record_l123_audit(
+                    audit_rows,
+                    persist_to_snowflake=True,
+                    table_name=getattr(
+                        settings, "l123_audit_table", "WALLE_L123_TAXONOMY_AUDIT"
+                    ),
+                )
+    except Exception as exc:
+        # Audit is best-effort; never fail the L123 run because of it.
+        print(f"[L123] audit emission failed (non-fatal): {exc}")
+
     # Print summary
     summary = classifier.metrics.get_summary_dict()
     print(f"[L123] Metrics: {summary}")
