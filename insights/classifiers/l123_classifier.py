@@ -368,6 +368,7 @@ async def run_l123_classification(
     batch_size: int = 10,
     workers: int = 3,
     debug: bool = False,
+    disable_taxonomy_validation: bool = False,
 ) -> str:
     """
     Run L1/L2/L3 classification on a CSV file.
@@ -379,7 +380,11 @@ async def run_l123_classification(
         batch_size: Number of incidents per API call
         workers: Number of parallel workers
         debug: Enable debug output
-    
+        disable_taxonomy_validation: Req 1+3 kill switch. When True, the
+            L123Classifier skips taxonomy validation/repair entirely and
+            no `_validation_*` sidecar columns are written. Default False
+            preserves the new Req 1+3 enforcement behavior.
+
     Returns:
         Path to the output file
     """
@@ -432,6 +437,7 @@ async def run_l123_classification(
         batch_size=batch_size,
         workers=workers,
         debug=debug,
+        disable_taxonomy_validation=disable_taxonomy_validation,
     )
     
     results = await classifier.classify_all(incidents)
