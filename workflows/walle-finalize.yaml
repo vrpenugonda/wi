@@ -50,6 +50,10 @@ jobs:
     name: Finalize Pipeline
     runs-on: uhg-runner
     timeout-minutes: 30
+    # Req 1+3: pin canonical run id so any audit/null-reason rows we write
+    # from this job share the same walle_run_id as the L123 partition workers.
+    env:
+      WALLE_RUN_ID: ${{ inputs.run_timestamp }}
 
     steps:
       - name: Checkout repository
@@ -138,6 +142,171 @@ jobs:
         with:
           path: artifacts/
 
+      # =========================================================================
+      # Req 1+3: emit audit / null-reason rows to Snowflake, then strip sidecar
+      # columns from the merged L123 CSV so they never reach
+      # WALLE_CLASSIFIED_INCIDENTS.
+      #
+      # This step is the SINGLE place where Req 1+3 audit data is persisted to
+      # Snowflake - the L123 partition workers and the l123-merge job
+      # intentionally have no Snowflake credentials. Best-effort
+      # (continue-on-error) preserves no-crash semantics: a transient Snowflake
+      # hiccup here will NOT block the main WALLE_CLASSIFIED_INCIDENTS upload.
+      # =========================================================================
+      - name: Req 1+3 - Emit audit rows and strip sidecar columns
+        id: req1_3_emit
+        shell: bash
+        continue-on-error: true
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run python << 'PYEOF'
+          import glob
+          import json
+          import os
+          import pandas as pd
+
+          run_id = os.environ.get("WALLE_RUN_ID", "")
+          print("=" * 60)
+          print(f"Req 1+3 audit emit + sidecar strip (run_id={run_id})")
+          print("=" * 60)
+
+          SIDECAR_PREFIXES = ("_validation_", "_original_l")
+          SIDECAR_EXACT = {"_repair_applied"}
+
+          # ---------------------------------------------------------------
+          # (a) Emit WALLE_L123_TAXONOMY_AUDIT from sidecar columns on the
+          #     merged L123 CSV; then strip those columns in place so the
+          #     downstream `walle finalize` never sees them.
+          # ---------------------------------------------------------------
+          merged_files = sorted(set(
+              glob.glob("artifacts/l123-merged-*/classified_incidents_*.csv")
+              + glob.glob("artifacts/**/classified_incidents_*.csv", recursive=True)
+          ))
+          print(f"Merged L123 files discovered: {len(merged_files)}")
+
+          audit_rows = []
+          try:
+              from insights.utils.l123_audit_logging import L123AuditRow, record_l123_audit
+              audit_helpers_ok = True
+          except Exception as exc:
+              print(f"[Req 1+3] Could not import L123 audit helpers: {exc}")
+              audit_helpers_ok = False
+
+          for f in merged_files:
+              try:
+                  df = pd.read_csv(f)
+              except Exception as exc:
+                  print(f"  Skipping unreadable file {f}: {exc}")
+                  continue
+
+              if "_validation_status" in df.columns and audit_helpers_ok:
+                  invalid = df[
+                      df["_validation_status"].notna()
+                      & (df["_validation_status"].astype("string") != "valid")
+                  ]
+                  print(f"  {f}: {len(invalid)} non-`valid` audit rows")
+                  for _, r in invalid.iterrows():
+                      details = None
+                      d = r.get("_validation_details")
+                      if isinstance(d, str) and d:
+                          try:
+                              details = json.loads(d)
+                          except Exception:
+                              details = {"raw": d}
+                      in_id = r.get("in_id") or r.get("incident_id")
+                      if not in_id:
+                          continue
+                      audit_rows.append(L123AuditRow(
+                          in_id=str(in_id),
+                          walle_run_id=run_id,
+                          status=str(r["_validation_status"]),
+                          original_l1=r.get("_original_l1"),
+                          original_l2=r.get("_original_l2"),
+                          original_l3=r.get("_original_l3"),
+                          final_l1=r.get("ai_l1"),
+                          final_l2=r.get("ai_l2"),
+                          final_l3=r.get("ai_l3"),
+                          repair_applied=bool(r.get("_repair_applied")) if pd.notna(r.get("_repair_applied")) else False,
+                          details=details,
+                      ))
+
+              # Strip sidecar columns in place. Idempotent / safe even when
+              # the file has none (validator disabled or pre-Req-1+3 data).
+              drop_cols = [
+                  c for c in df.columns
+                  if c.startswith(SIDECAR_PREFIXES) or c in SIDECAR_EXACT
+              ]
+              if drop_cols:
+                  df = df.drop(columns=drop_cols)
+                  df.to_csv(f, index=False)
+                  print(f"  Stripped sidecar columns from {f}: {drop_cols}")
+
+          if audit_rows:
+              try:
+                  record_l123_audit(audit_rows, persist_to_snowflake=True)
+                  print(f"[Req 1+3] Persisted {len(audit_rows)} L123 audit rows")
+              except Exception as exc:
+                  print(f"[Req 1+3] L123 audit persist FAILED (non-fatal): {exc}")
+          else:
+              print("[Req 1+3] No L123 audit rows to persist for this run")
+
+          # ---------------------------------------------------------------
+          # (b) Emit WALLE_L4_NULL_REASONS rows for the synthetic L4
+          #     checkpoint cohort (reason = 'l123_invalid_blocks_l4').
+          # ---------------------------------------------------------------
+          synthetic = sorted(set(
+              glob.glob("artifacts/l4-synthetic-uncategorized-*/l4_uncategorized_synthetic_checkpoint.csv")
+              + glob.glob("artifacts/**/l4_uncategorized_synthetic_checkpoint.csv", recursive=True)
+          ))
+          print(f"Synthetic L4 checkpoints discovered: {len(synthetic)}")
+
+          null_rows = []
+          try:
+              from insights.utils.l4_null_logging import L4NullRow, record_l4_nulls
+              null_helpers_ok = True
+          except Exception as exc:
+              print(f"[Req 1+3] Could not import L4 NULL helpers: {exc}")
+              null_helpers_ok = False
+
+          if null_helpers_ok:
+              for f in synthetic:
+                  try:
+                      df = pd.read_csv(f)
+                  except Exception as exc:
+                      print(f"  Skipping unreadable file {f}: {exc}")
+                      continue
+                  for _, r in df.iterrows():
+                      in_id = r.get("incident_id")
+                      if not in_id or pd.isna(in_id):
+                          continue
+                      null_rows.append(L4NullRow(
+                          in_id=str(in_id),
+                          reason="l123_invalid_blocks_l4",
+                          walle_run_id=run_id,
+                          subcategory="Uncategorized",
+                          cause="L123 classification was Uncategorized; L4 not attempted by design",
+                      ))
+
+          if null_rows:
+              try:
+                  record_l4_nulls(null_rows, persist_to_snowflake=True)
+                  print(f"[Req 1+3] Persisted {len(null_rows)} L4 NULL reason rows (l123_invalid_blocks_l4)")
+              except Exception as exc:
+                  print(f"[Req 1+3] L4 NULL persist FAILED (non-fatal): {exc}")
+          else:
+              print("[Req 1+3] No synthetic L4 cohort for this run; nothing to persist")
+
+          print("=" * 60)
+          PYEOF
+
       - name: Merge results and upload
         id: merge
         shell: bash
@@ -185,6 +354,67 @@ jobs:
           echo "  S3 Blob Storage: done"
           echo "  Snowflake: done"
           echo "=========================================="
+
+      # =========================================================================
+      # Req 1+3 audit summary: best-effort breakdown of taxonomy validation and
+      # L4 NULL outcomes for the current run. Never fails the workflow.
+      # =========================================================================
+      - name: Req 1+3 audit summary
+        shell: bash
+        continue-on-error: true
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_CERTIFICATE: ${{ secrets.SNOWFLAKE_CERTIFICATE }}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run python << 'PYEOF'
+          import os
+          run_id = os.environ.get("WALLE_RUN_ID", "")
+          print("=" * 60)
+          print(f"Req 1+3 audit breakdown for run_id={run_id}")
+          print("=" * 60)
+          try:
+              from insights.utils.snowflake import get_snowflake_connection
+              conn = get_snowflake_connection()
+              cur = conn.cursor()
+              try:
+                  cur.execute(
+                      "SELECT status, COUNT(*) FROM WALLE_L123_TAXONOMY_AUDIT "
+                      f"WHERE walle_run_id = '{run_id}' GROUP BY status ORDER BY 2 DESC"
+                  )
+                  rows = cur.fetchall()
+                  print(f"\nWALLE_L123_TAXONOMY_AUDIT ({len(rows)} status buckets):")
+                  for r in rows:
+                      print(f"  {r[0]}: {r[1]}")
+                  if not rows:
+                      print("  (no rows for this run)")
+              except Exception as exc:
+                  print(f"  query failed (non-fatal): {exc}")
+              try:
+                  cur.execute(
+                      "SELECT reason, COUNT(*) FROM WALLE_L4_NULL_REASONS "
+                      f"WHERE walle_run_id = '{run_id}' GROUP BY reason ORDER BY 2 DESC"
+                  )
+                  rows = cur.fetchall()
+                  print(f"\nWALLE_L4_NULL_REASONS ({len(rows)} reason buckets):")
+                  for r in rows:
+                      print(f"  {r[0]}: {r[1]}")
+                  if not rows:
+                      print("  (no rows for this run)")
+              except Exception as exc:
+                  print(f"  query failed (non-fatal): {exc}")
+              finally:
+                  cur.close()
+                  conn.close()
+          except Exception as exc:
+              print(f"Could not connect to Snowflake (non-fatal): {exc}")
+          print("=" * 60)
+          PYEOF
 
       - name: Upload final results artifact
         id: upload-final-1

@@ -94,8 +94,20 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           uv sync --frozen
 
+      - name: Compute canonical run id
+        id: runid
+        shell: bash
+        run: |
+          RUN_ID=$(date -u +%Y%m%d_%H%M%S)
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "Computed canonical run id: ${RUN_ID}"
+
       - name: Run L4-only backfill
         env:
+          # Req 1+3: pin canonical run id so audit/null-reason rows from this
+          # invocation share a single walle_run_id (otherwise repeated
+          # get_run_id() calls within the same process can drift across seconds).
+          WALLE_RUN_ID: ${{ steps.runid.outputs.run_id }}
           # Azure / auth (required for L4 calls)
           AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
           AZURE_DEPLOYMENT: ${{ secrets.AZURE_DEPLOYMENT }}
@@ -139,6 +151,11 @@ jobs:
             read -r -a SUBCAT_LIST <<< "${SUBCATEGORIES_INPUT}"
             SUBCAT_ARGS=(--subcategories "${SUBCAT_LIST[@]}")
           fi
+          # Note: Req 1+3 path-integrity is enforced inside the unified
+          # ClassificationPipeline runner (`_run_l4` pre-L4 gate). Any historical
+          # incidents loaded here that already have ai_l2 == "Uncategorized"
+          # will be routed to ai_l4 = "Unclassified" without an L4 model call.
+          # No workflow-level filter is needed here.
           uv run python -m insights run \
             --l4-only \
             --start-date "${START_DATE}" \

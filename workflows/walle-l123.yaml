@@ -15,6 +15,11 @@ on:
       environment:
         required: true
         type: string
+      disable_taxonomy_validation:
+        description: "Req 1+3 kill switch: pass --disable-taxonomy-validation to walle l123 partition workers."
+        required: false
+        type: boolean
+        default: false
     outputs:
       l123_merged_file:
         description: "Path to merged L123 results file"
@@ -163,6 +168,10 @@ jobs:
           SCOPE: ${{ secrets.SCOPE }}
           PROJECT_ID: ${{ secrets.PROJECT_ID }}
           X_UPSTREAM_ENV: ${{ inputs.environment == 'prod' && 'prod' || 'nonprod' }}
+          # Req 1+3: pin canonical run id so audit rows from every partition
+          # worker share the same walle_run_id as the merge/finalize jobs.
+          WALLE_RUN_ID: ${{ inputs.run_timestamp }}
+          DISABLE_TAXONOMY_VALIDATION: ${{ inputs.disable_taxonomy_validation && 'true' || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -221,12 +230,24 @@ jobs:
           
           OUTPUT_FILE="$(pwd)/data/output/l123_partition_${WORKER_ID}_${{ inputs.run_timestamp }}.csv"
           
+          # Req 1+3 kill switch: append --disable-taxonomy-validation when
+          # the workflow input is true. Default behavior (false) matches the
+          # pre-Req-1+3 path apart from the validator now being in place.
+          KILL_SWITCH_FLAG=""
+          if [[ "${DISABLE_TAXONOMY_VALIDATION:-false}" == "true" ]]; then
+            KILL_SWITCH_FLAG="--disable-taxonomy-validation"
+            echo "Req 1+3 taxonomy validation: DISABLED via workflow input"
+          else
+            echo "Req 1+3 taxonomy validation: enabled (default)"
+          fi
+
           echo "Running L123 classification on $PARTITION_FILE..."
           uv run walle l123 \
             --input "$PARTITION_FILE" \
             --output "$OUTPUT_FILE" \
             --batch-size 10 \
-            --workers 100
+            --workers 100 \
+            $KILL_SWITCH_FLAG
           
           echo "Partition $WORKER_ID complete: $OUTPUT_FILE"
 
@@ -380,8 +401,13 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           
-          mkdir -p data/output
+          mkdir -p data/output data/checkpoints
           MERGED_FILE="data/output/classified_incidents_${{ inputs.run_timestamp }}.csv"
+          # Req 1+3: synthetic checkpoint for the L123-Uncategorized cohort.
+          # Written by the inline Python below ONLY when at least one row has
+          # ai_l2 == "Uncategorized". Empty/no-cohort runs do NOT create this
+          # file, so the upload step's hashFiles() guard becomes a no-op.
+          SYNTHETIC_CHECKPOINT="data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv"
           
           uv run python << EOF
           import pandas as pd
@@ -498,10 +524,55 @@ jobs:
           merged.to_csv("$MERGED_FILE", index=False)
           print(f"\nMerged: {len(merged)} total records -> $MERGED_FILE")
           print(f"Columns: {list(merged.columns)}")
-          
+
+          # =====================================================================
+          # Req 1+3 path-integrity gate (CSV-only; no Snowflake writes here).
+          # When the L123 validator buckets a row into "Uncategorized", we must
+          # NOT spawn an L4 job for that row. Instead we synthesize an L4
+          # checkpoint that pre-fills ai_l4 = "Unclassified" and routes the row
+          # straight into walle finalize. The synthetic file is also the manifest
+          # finalize uses to emit WALLE_L4_NULL_REASONS rows
+          # (reason='l123_invalid_blocks_l4').
+          #
+          # Sidecar _validation_* columns are intentionally KEPT on the merged
+          # file so finalize can emit WALLE_L123_TAXONOMY_AUDIT rows. They are
+          # stripped by walle-finalize.yaml just before the main-table upload.
+          # =====================================================================
           subcol = 'ai_l2' if 'ai_l2' in merged.columns else ('subcategory' if 'subcategory' in merged.columns else None)
+          uncat_count = 0
           if subcol and subcol in merged.columns:
-              subcats = merged[subcol].dropna().unique().tolist()
+              uncat_mask = merged[subcol].astype("string") == "Uncategorized"
+              uncat_count = int(uncat_mask.sum())
+              if uncat_count > 0:
+                  print(f"\n[Req 1+3] {uncat_count} row(s) with {subcol} == 'Uncategorized'; "
+                        f"synthesizing L4 checkpoint and excluding from L4 matrix")
+                  uncat_df = merged.loc[uncat_mask].copy()
+                  id_col = 'in_id' if 'in_id' in uncat_df.columns else 'incident_id'
+                  synthetic = pd.DataFrame({
+                      'incident_id': uncat_df[id_col].astype(str).values,
+                      'l4_category': 'Unclassified',
+                      'l4_subcategory': None,
+                      'l4_confidence': 0.0,
+                      'resolution_action': 'Not attempted (L123 was Uncategorized)',
+                      'is_actionable': False,
+                      'actionability_reason': 'L123 classification was Uncategorized; L4 not attempted by design (Req 1+3 path integrity)',
+                      'l4_rationale': 'l123_invalid_blocks_l4',
+                  })
+                  synthetic.to_csv("$SYNTHETIC_CHECKPOINT", index=False)
+                  print(f"[Req 1+3] Wrote synthetic L4 checkpoint -> $SYNTHETIC_CHECKPOINT ({len(synthetic)} rows)")
+              else:
+                  print("\n[Req 1+3] No 'Uncategorized' rows; synthetic checkpoint not created")
+
+              # L4 matrix builder: exclude 'Uncategorized'. This filter is the
+              # single place that prevents an L4 job from being spawned for the
+              # Uncategorized cohort. Pre-Req-1+3 partition CSVs never produced
+              # ai_l2 == 'Uncategorized' (validator wasn't running), so this is
+              # a no-op against historical data.
+              raw_subcats = merged[subcol].dropna().unique().tolist()
+              subcats = [s for s in raw_subcats if s and s != 'Uncategorized']
+              if len(raw_subcats) != len(subcats):
+                  print(f"[Req 1+3] L4 matrix: filtered 'Uncategorized' "
+                        f"(raw={len(raw_subcats)} -> matrix={len(subcats)})")
               print(f"\nFound {len(subcats)} subcategories: {subcats}")
           else:
               subcats = []
@@ -553,4 +624,44 @@ jobs:
         with:
           name: l123-merged-${{ inputs.run_timestamp }}
           path: data/output/classified_incidents_*.csv
+          retention-days: 7
+
+      # =========================================================================
+      # Req 1+3: synthetic L4 checkpoint for the L123-Uncategorized cohort.
+      # Only uploads when the merge step actually produced the file (i.e. there
+      # was at least one Uncategorized row). When absent, hashFiles() returns ''
+      # and the step is skipped entirely - no empty artifact is created.
+      # walle-finalize.yaml's existing download-all-artifacts step will pick this
+      # up automatically and walle finalize's checkpoint glob already matches
+      # files containing both 'l4' and 'checkpoint'.
+      # =========================================================================
+      - name: Upload synthetic Unclassified L4 checkpoint (Req 1+3)
+        if: hashFiles('data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv') != ''
+        id: upload-l4-synthetic-1
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l4-synthetic-uncategorized-${{ inputs.run_timestamp }}
+          path: data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv
+          retention-days: 7
+
+      - name: Retry upload synthetic L4 checkpoint (attempt 2)
+        if: hashFiles('data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv') != '' && steps.upload-l4-synthetic-1.outcome == 'failure'
+        id: upload-l4-synthetic-2
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          name: l4-synthetic-uncategorized-${{ inputs.run_timestamp }}
+          path: data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv
+          retention-days: 7
+
+      - name: Retry upload synthetic L4 checkpoint (attempt 3)
+        if: hashFiles('data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv') != '' && steps.upload-l4-synthetic-1.outcome == 'failure' && steps.upload-l4-synthetic-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: l4-synthetic-uncategorized-${{ inputs.run_timestamp }}
+          path: data/checkpoints/l4_uncategorized_synthetic_checkpoint.csv
           retention-days: 7
