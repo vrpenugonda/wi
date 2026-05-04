@@ -25,6 +25,11 @@ L4NullReason = Literal[
     "l4_skipped",
     "l4_failed_batch",
     "l4_result_dropped_unmappable",
+    # Req 1+3: L123 was Uncategorized, L4 deliberately not attempted.
+    # Persisted alongside an `ai_l4 = "Unclassified"` value (not NULL) so
+    # downstream readers can distinguish "blocked-by-policy" from
+    # "pipeline failure" cohorts.
+    "l123_invalid_blocks_l4",
 ]
 
 
@@ -158,5 +163,6 @@ def record_l4_nulls(
         "persist_error": persist_error,
         "breakdown": summary,
         "snowflake_table": table_name,
-        "snowflake_target": f"{settings.snowflake_database_test}.{settings.snowflake_schema_test}.{table_name}",
+        "snowflake_target": f"{settings.snowflake_database}.{settings.snowflake_schema}.{table_name}",
     }
+
