@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -255,7 +256,21 @@ def sync_taxonomies_from_s3() -> int:
 # =============================================================================
 
 def get_run_id() -> str:
-    """Generate a unique run ID based on timestamp."""
+    """Return a canonical run ID for this WALLE run.
+
+    Honors the ``WALLE_RUN_ID`` environment variable when set so that all
+    partition workers, the L123 merge job, and the finalize job in a single
+    GitHub Actions workflow share the same canonical id. This is what ties
+    together rows in ``WALLE_L123_TAXONOMY_AUDIT``, ``WALLE_L4_NULL_REASONS``,
+    and ``WALLE_CLASSIFIED_INCIDENTS`` for the same run.
+
+    Falls back to ``datetime.now().strftime("%Y%m%d_%H%M%S")`` when the env
+    var is unset, preserving the original behavior for local runs and any
+    callers that don't set it.
+    """
+    env_id = os.environ.get("WALLE_RUN_ID")
+    if env_id:
+        return env_id
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
