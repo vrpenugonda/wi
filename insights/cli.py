@@ -194,7 +194,12 @@ def create_parser() -> argparse.ArgumentParser:
         default=100,
         help="Parallel workers",
     )
-    
+    l123_parser.add_argument(
+        "--disable-taxonomy-validation",
+        action="store_true",
+        help="Disable Req 1+3 L123 taxonomy validation/repair/audit (kill switch)",
+    )
+
     # =========================================================================
     # l4 command - L4 classification
     # =========================================================================
@@ -533,6 +538,9 @@ async def cmd_l123(args):
         batch_size=args.batch_size,
         workers=args.workers,
         debug=args.debug,
+        disable_taxonomy_validation=getattr(
+            args, "disable_taxonomy_validation", False
+        ),
     )
     
     print(f"\nL123 classification complete. Output: {output}")
