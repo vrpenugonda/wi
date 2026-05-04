@@ -55,8 +55,8 @@ class Settings(BaseSettings):
     
     # Snowflake Configuration
     snowflake_account: str = Field(default="", alias="SNOWFLAKE_ACCOUNT")
-    snowflake_database_test: str = Field(default="", alias="SNOWFLAKE_DATABASE_TEST")
-    snowflake_schema_test: str = Field(default="", alias="SNOWFLAKE_SCHEMA_TEST")
+    snowflake_database: str = Field(default="", alias="SNOWFLAKE_DATABASE")
+    snowflake_schema: str = Field(default="", alias="SNOWFLAKE_SCHEMA")
     snowflake_user: str = Field(default="", alias="SNOWFLAKE_USER")
     snowflake_warehouse: str = Field(default="", alias="SNOWFLAKE_WAREHOUSE")
     snowflake_certificate: str = Field(default="", alias="SNOWFLAKE_CERTIFICATE")
@@ -64,6 +64,20 @@ class Settings(BaseSettings):
     
     # Taxonomy generation settings
     taxonomy_generation_days: int = Field(default=30, alias="TAXONOMY_GENERATION_DAYS")
+
+    # L123 taxonomy validation (Req 1+3)
+    enable_l123_taxonomy_validation: bool = Field(
+        default=True, alias="ENABLE_L123_TAXONOMY_VALIDATION"
+    )
+    l123_alias_map_path: str = Field(
+        default="insights/validation/aliases.json", alias="L123_ALIAS_MAP_PATH"
+    )
+    l123_audit_persist: bool = Field(
+        default=True, alias="L123_AUDIT_PERSIST"
+    )
+    l123_audit_table: str = Field(
+        default="WALLE_L123_TAXONOMY_AUDIT", alias="L123_AUDIT_TABLE"
+    )
     
     # Processing Configuration
     batch_size: int = Field(default=1, ge=1, le=50)
