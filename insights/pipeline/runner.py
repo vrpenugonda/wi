@@ -784,15 +784,42 @@ class ClassificationPipeline:
         # the L4 model can classify under. We synthesize an L4 checkpoint
         # for this cohort with `l4_category = "Unclassified"` and emit
         # `WALLE_L4_NULL_REASONS` rows with reason `l123_invalid_blocks_l4`.
+        #
+        # Scenario O: NULL/empty/'none' subcategory values must be treated
+        # the same as the literal "Uncategorized" string. NaN != string in
+        # pandas, so a strict equality mask used to leak those rows past
+        # the gate; they then ended up with NULL ai_l4 and zero audit
+        # coverage.
+        def _is_uncat_or_null(v: Any) -> bool:
+            if v is None:
+                return True
+            try:
+                if pd.isna(v):
+                    return True
+            except Exception:
+                pass
+            s = str(v).strip()
+            return s == "" or s == "Uncategorized" or s.lower() == "none"
+
         uncategorized_synthetic_checkpoint: str | None = None
         if subcategory_col is not None:
             try:
-                uncategorized_mask = df[subcategory_col].astype(str) == "Uncategorized"
+                uncategorized_mask = df[subcategory_col].apply(_is_uncat_or_null)
             except Exception:
                 uncategorized_mask = None  # type: ignore[assignment]
             if uncategorized_mask is not None and bool(uncategorized_mask.any()):
                 uncategorized_df = df[uncategorized_mask].copy()
                 df = df[~uncategorized_mask].copy()
+                # Normalize the cohort's L1/L2/L3 to the canonical
+                # Uncategorized bucket so downstream merges and the
+                # synthetic checkpoint see consistent values for rows
+                # that arrived NULL/empty/'none'.
+                for _norm_col in ("ai_l1", "ai_l2", "ai_l3", "category", "subcategory", "product"):
+                    if _norm_col in uncategorized_df.columns:
+                        try:
+                            uncategorized_df[_norm_col] = "Uncategorized"
+                        except Exception:
+                            pass
                 try:
                     uncategorized_synthetic_checkpoint = self._build_uncategorized_l4_checkpoint(
                         uncategorized_df,
