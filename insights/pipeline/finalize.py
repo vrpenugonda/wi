@@ -123,6 +123,189 @@ def discover_csv_files(artifacts_dir: str | Path) -> dict[str, list[str]]:
     return categories
 
 
+def _emit_l123_backfill_audit(
+    backfilled_ids: list[str],
+    run_id: str,
+    reason: str = "null_in_finalize",
+) -> None:
+    """Persist `WALLE_L123_TAXONOMY_AUDIT` rows for the cohort whose
+    L1/L2/L3 were NULL/empty/'none' at finalize time and got backfilled
+    to "Uncategorized" by ``_finalize_backfill_null_l123``.
+
+    Status code is the existing ``pipeline_gap`` (already in
+    `L123AuditStatus`/`L123_AUDIT_STATUSES`). Originals are NULL because
+    we never had them at this stage; finals are "Uncategorized" matching
+    what was just written into the merged CSV.
+
+    Best-effort: any failure is logged and swallowed - this audit must
+    never block the main-table upload.
+    """
+    if not backfilled_ids:
+        return
+    try:
+        from insights.config import settings
+        from insights.utils.l123_audit_logging import L123AuditRow, record_l123_audit
+
+        if not getattr(settings, "l123_audit_persist", True):
+            print(
+                f"[REQ-1+3] L123 backfill audit skipped "
+                f"(settings.l123_audit_persist=False) for {len(backfilled_ids)} incident(s)",
+                flush=True,
+            )
+            return
+
+        rows: list[L123AuditRow] = [
+            L123AuditRow(
+                in_id=str(in_id),
+                walle_run_id=run_id,
+                status="pipeline_gap",
+                original_l1=None,
+                original_l2=None,
+                original_l3=None,
+                final_l1="Uncategorized",
+                final_l2="Uncategorized",
+                final_l3="Uncategorized",
+                repair_applied=False,
+                details={"reason": reason, "source": "finalize_backfill"},
+            )
+            for in_id in backfilled_ids
+            if in_id
+        ]
+        record_l123_audit(
+            rows,
+            persist_to_snowflake=True,
+            table_name=getattr(
+                settings, "l123_audit_table", "WALLE_L123_TAXONOMY_AUDIT"
+            ),
+            log_each_incident=False,
+        )
+    except Exception as exc:
+        print(
+            f"[REQ-1+3] L123 backfill audit emission failed (non-fatal): {exc}",
+            flush=True,
+        )
+
+
+def _finalize_backfill_null_l123(final_file: Path) -> list[str]:
+    """Scan ``final_file`` for NULL/empty/'none' values in
+    ``ai_l1``/``ai_l2``/``ai_l3`` and rewrite them to "Uncategorized"
+    in place. Returns the de-duplicated list of in_ids whose row was
+    affected (so callers can emit `WALLE_L123_TAXONOMY_AUDIT` rows).
+
+    This is Scenario P1 - belt-and-suspenders for legacy/edge-case rows
+    that arrive at finalize with NULL L123 even though the upstream gate
+    should have caught them. Without this, the main table would contain
+    NULL L1/L2/L3 in the new run's cohort, violating the Req 1+3
+    invariant.
+    """
+    if not final_file.exists():
+        return []
+
+    df = pd.read_csv(final_file)
+    if df.empty or "in_id" not in df.columns:
+        return []
+
+    affected_ids: set[str] = set()
+    columns_changed = False
+    for col in ("ai_l1", "ai_l2", "ai_l3"):
+        if col not in df.columns:
+            continue
+        # NaN | empty-string | literal "none" (case-insensitive)
+        try:
+            string_view = df[col].astype("string")
+        except Exception:
+            string_view = df[col].astype(str)
+        mask = (
+            df[col].isna()
+            | (string_view.str.strip() == "")
+            | (string_view.str.lower() == "none")
+        )
+        if not bool(mask.any()):
+            continue
+        affected_ids.update(
+            df.loc[mask, "in_id"].astype(str).str.strip().tolist()
+        )
+        df.loc[mask, col] = "Uncategorized"
+        columns_changed = True
+
+    affected_ids.discard("")
+
+    if columns_changed:
+        df.to_csv(final_file, index=False)
+        print(
+            f"[REQ-1+3] Finalize backfill: NULL/empty L1/L2/L3 -> 'Uncategorized' "
+            f"for {len(affected_ids)} unique incident(s) in {final_file.name}",
+            flush=True,
+        )
+
+    return sorted(affected_ids)
+
+
+def _emit_final_l4_null_audit(final_file: Path, run_id: str) -> None:
+    """Scan the finalized merged CSV for missing ai_l4 and persist
+    `WALLE_L4_NULL_REASONS` rows.
+
+    Mirrors the unified runner's logic in
+    ``insights/pipeline/runner.py`` lines 375-429 so the decomposed
+    GitHub-Actions path produces the same audit output as ``walle run``.
+
+    Reason categorization (CI path only):
+
+    - All missing-``ai_l4`` rows: ``reason="l4_missing_after_l4_run"``.
+      The ``l4_invalid_category_cleaned`` distinction lives inside the
+      per-subcategory ``walle l4`` workers and is not currently surfaced
+      to finalize. That's a Phase-2 enhancement (L4 sidecar artifact).
+
+    Best-effort: ``record_l4_nulls`` already auto-creates the target
+    table and swallows Snowflake errors with a warning, so this helper
+    never raises into the caller under normal operation.
+    """
+    from insights.utils.l4_null_logging import L4NullRow, record_l4_nulls
+
+    if not final_file.exists():
+        return
+    df = pd.read_csv(final_file)
+    if "in_id" not in df.columns:
+        return
+
+    def _is_missing(v: Any) -> bool:
+        if v is None or pd.isna(v):
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() == "none"
+
+    if "ai_l4" not in df.columns:
+        missing_mask = df["in_id"].apply(lambda _: True)
+    else:
+        missing_mask = df["ai_l4"].apply(_is_missing)
+
+    null_rows: list[L4NullRow] = []
+    for _, r in df.loc[missing_mask].iterrows():
+        in_id = str(r.get("in_id") or "").strip()
+        if not in_id:
+            continue
+        subcat = r.get("ai_l2")
+        null_rows.append(
+            L4NullRow(
+                in_id=in_id,
+                reason="l4_missing_after_l4_run",
+                cause="ai_l4_missing_in_final_merge",
+                subcategory=(
+                    str(subcat)
+                    if subcat is not None and not pd.isna(subcat)
+                    else None
+                ),
+                walle_run_id=run_id,
+            )
+        )
+
+    if not null_rows:
+        print(f"[L4-NULL] no missing-ai_l4 rows for run_id={run_id}")
+        return
+
+    record_l4_nulls(null_rows, persist_to_snowflake=True, log_each_incident=False)
+
+
 def _load_l123_merged(files: list[str]) -> pd.DataFrame | None:
     """Load and deduplicate L123 merged file(s)."""
     print(f"\nLoading L123 merged file(s) (preferred - has original columns)...")
@@ -474,6 +657,21 @@ def run_finalize(
     # Step 1: Merge
     merge_stats = merge_results(artifacts_dir, output_file)
 
+    # Step 1b: Req 1+3 Scenario P1 path-integrity backfill.
+    # Any row that arrives at finalize with NULL/empty/'none' L1/L2/L3
+    # is rewritten to "Uncategorized" in the merged CSV BEFORE S3 and
+    # Snowflake uploads, and we emit a `pipeline_gap` audit row per
+    # affected incident. This guarantees the new-incident invariant:
+    # `WALLE_CLASSIFIED_INCIDENTS` never receives NULL ai_l1/ai_l2/ai_l3
+    # for rows produced by this run. Best-effort: backfill scan errors
+    # never block the upload pipeline.
+    try:
+        backfilled_ids = _finalize_backfill_null_l123(Path(output_file))
+        if backfilled_ids:
+            _emit_l123_backfill_audit(backfilled_ids, run_id)
+    except Exception as exc:
+        print(f"[REQ-1+3] Finalize NULL-L123 backfill failed (non-fatal): {exc}")
+
     # Step 2: S3 upload
     s3_result = None
     if not skip_s3:
@@ -510,6 +708,15 @@ def run_finalize(
     sf_status = sf_result.get("success", False) if isinstance(sf_result, dict) else sf_result
     print(f"  Snowflake: {sf_status}")
     print("=" * 42)
+
+    # Final-state AI_L4 NULL audit (parity with ClassificationPipeline.run()
+    # in insights/pipeline/runner.py lines 375-429). Best-effort: never fail
+    # the workflow on audit hiccups - the main-table upload above is the
+    # source of truth for finalize's exit status.
+    try:
+        _emit_final_l4_null_audit(output_file, run_id)
+    except Exception as exc:
+        print(f"AI_L4 NULL final-reason logging failed (non-fatal): {exc}")
 
     # Write stats file alongside output
     stats_file = output_file.parent / "merge_stats.json"
