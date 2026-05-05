@@ -184,7 +184,6 @@ Always provide a rationale explaining your classification decision.
     def _synthesize_pipeline_gap_rows(
         self,
         ids: list[str],
-        input_lookup: dict[str, dict[str, Any]],
         reason: str,
     ) -> list[dict[str, Any]]:
         """Build synthesized Uncategorized rows for incidents the L123
@@ -211,14 +210,25 @@ Always provide a rationale explaining your classification decision.
         except Exception:
             details_blob = None
         for in_id in ids:
-            src = input_lookup.get(in_id, {})
+            # Field names mirror `IncidentClassification.model_dump()`
+            # (insights/models/schemas.py) so the row shape matches what
+            # the LLM normally produces. `L123_COLUMN_MAP` (walle-l123.yaml,
+            # finalize.py) renames `confidence_score` -> `ai_confidence`,
+            # `rationale` -> `ai_rationale`, etc.; using non-canonical field
+            # names here would create stray columns in the merged CSV and
+            # leave `ai_*` cells NaN for the synthesized cohort.
             row: dict[str, Any] = {
                 "incident_id": in_id,
                 "category": "Uncategorized",
                 "subcategory": "Uncategorized",
                 "product": "Uncategorized",
-                "confidence": 0.0,
+                "vendor": None,
+                "confidence_score": 0.0,
+                "self_resolved": False,
                 "rationale": f"L123 classifier produced no output ({reason})",
+                "keywords_identified": [],
+                "root_cause_indicator": None,
+                "root_cause": None,
                 "_validation_status": "pipeline_gap",
                 "_original_l1": None,
                 "_original_l2": None,
@@ -226,15 +236,13 @@ Always provide a rationale explaining your classification decision.
                 "_repair_applied": False,
                 "_validation_details": details_blob,
             }
-            # Carry through brief description if available so audit
-            # downstream consumers can show a human-readable hint.
-            brief = (
-                src.get("brief_description")
-                or src.get("Short Description")
-                or src.get("description")
-            )
-            if brief:
-                row["brief_description"] = brief
+            # NOTE: Do NOT add `brief_description` (or other input fields)
+            # to synthesized rows. Real L123 classifications come straight
+            # from the LLM's `IncidentClassification` model and don't
+            # carry input columns; injecting them here would cause the
+            # `walle-l123.yaml` merge against the original CSV to emit
+            # `brief_description_x` / `brief_description_y` collisions.
+            # The diagnostic context lives in `_validation_details.reason`.
             rows.append(row)
         return rows
 
@@ -265,12 +273,10 @@ Always provide a rationale explaining your classification decision.
 
         # Capture the input id set up-front so we can reconcile against
         # the LLM's output (Scenarios M and N).
-        input_ids: list[str] = []
-        input_lookup: dict[str, dict[str, Any]] = {}
-        for idx, inc in enumerate(batch, 1):
-            in_id = self._resolve_input_id(inc, idx)
-            input_ids.append(in_id)
-            input_lookup[in_id] = inc
+        input_ids: list[str] = [
+            self._resolve_input_id(inc, idx)
+            for idx, inc in enumerate(batch, 1)
+        ]
 
         # Build prompt for batch processing
         incident_texts = []
@@ -351,7 +357,6 @@ INCIDENTS:
                                 validated.extend(
                                     self._synthesize_pipeline_gap_rows(
                                         dropped,
-                                        input_lookup,
                                         reason="missing_in_response",
                                     )
                                 )
@@ -375,7 +380,6 @@ INCIDENTS:
                         # nothing is silently dropped on auth exhaustion.
                         return self._synthesize_pipeline_gap_rows(
                             input_ids,
-                            input_lookup,
                             reason="auth_failed_max_token_refreshes",
                         )
                     if self.debug:
@@ -404,7 +408,6 @@ INCIDENTS:
                     # retries-exhausted exit.
                     return self._synthesize_pipeline_gap_rows(
                         input_ids,
-                        input_lookup,
                         reason="batch_failed_all_retries",
                     )
 
@@ -413,7 +416,6 @@ INCIDENTS:
         # batch is observable rather than silently lost.
         return self._synthesize_pipeline_gap_rows(
             input_ids,
-            input_lookup,
             reason="empty_response_all_retries",
         )
     
