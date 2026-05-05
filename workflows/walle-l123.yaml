@@ -541,13 +541,38 @@ jobs:
           subcol = 'ai_l2' if 'ai_l2' in merged.columns else ('subcategory' if 'subcategory' in merged.columns else None)
           uncat_count = 0
           if subcol and subcol in merged.columns:
-              uncat_mask = merged[subcol].astype("string") == "Uncategorized"
+              # Scenario O: NULL/empty/'none' subcategory values must be
+              # treated the same as the literal "Uncategorized" string.
+              # The previous strict-equality mask leaked those rows past
+              # the gate, leaving them with NULL ai_l4 and no audit row.
+              def _is_uncat_or_null(v):
+                  if v is None:
+                      return True
+                  try:
+                      if pd.isna(v):
+                          return True
+                  except Exception:
+                      pass
+                  s = str(v).strip()
+                  return s == "" or s == "Uncategorized" or s.lower() == "none"
+
+              uncat_mask = merged[subcol].apply(_is_uncat_or_null)
               uncat_count = int(uncat_mask.sum())
               if uncat_count > 0:
-                  print(f"\n[Req 1+3] {uncat_count} row(s) with {subcol} == 'Uncategorized'; "
-                        f"synthesizing L4 checkpoint and excluding from L4 matrix")
+                  print(f"\n[Req 1+3] {uncat_count} row(s) with {subcol} NULL/empty/'Uncategorized'; "
+                        f"normalizing L1/L2/L3 to 'Uncategorized', synthesizing L4 checkpoint, "
+                        f"and excluding from L4 matrix")
                   uncat_df = merged.loc[uncat_mask].copy()
                   id_col = 'in_id' if 'in_id' in uncat_df.columns else 'incident_id'
+                  # Backfill L1/L2/L3 in the merged CSV so the artifact
+                  # uploaded to walle-finalize is self-consistent. Without
+                  # this, finalize sees NULL ai_l1/ai_l2/ai_l3 in the
+                  # merged file and the path-integrity invariant breaks.
+                  for _norm_col in ('ai_l1', 'ai_l2', 'ai_l3', 'category', 'subcategory', 'product'):
+                      if _norm_col in merged.columns:
+                          merged.loc[uncat_mask, _norm_col] = 'Uncategorized'
+                  merged.to_csv("$MERGED_FILE", index=False)
+                  print(f"[Req 1+3] Backfilled L1/L2/L3 in merged CSV for {uncat_count} row(s) -> $MERGED_FILE")
                   synthetic = pd.DataFrame({
                       'incident_id': uncat_df[id_col].astype(str).values,
                       'l4_category': 'Unclassified',
@@ -555,23 +580,24 @@ jobs:
                       'l4_confidence': 0.0,
                       'resolution_action': 'Not attempted (L123 was Uncategorized)',
                       'is_actionable': False,
-                      'actionability_reason': 'L123 classification was Uncategorized; L4 not attempted by design (Req 1+3 path integrity)',
+                      'actionability_reason': 'L123 classification was Uncategorized/NULL; L4 not attempted by design (Req 1+3 path integrity)',
                       'l4_rationale': 'l123_invalid_blocks_l4',
                   })
                   synthetic.to_csv("$SYNTHETIC_CHECKPOINT", index=False)
                   print(f"[Req 1+3] Wrote synthetic L4 checkpoint -> $SYNTHETIC_CHECKPOINT ({len(synthetic)} rows)")
               else:
-                  print("\n[Req 1+3] No 'Uncategorized' rows; synthetic checkpoint not created")
+                  print("\n[Req 1+3] No NULL/'Uncategorized' rows; synthetic checkpoint not created")
 
-              # L4 matrix builder: exclude 'Uncategorized'. This filter is the
-              # single place that prevents an L4 job from being spawned for the
-              # Uncategorized cohort. Pre-Req-1+3 partition CSVs never produced
-              # ai_l2 == 'Uncategorized' (validator wasn't running), so this is
-              # a no-op against historical data.
+              # L4 matrix builder: exclude 'Uncategorized' AND NULL/empty.
+              # This filter is the single place that prevents an L4 job
+              # from being spawned for the Uncategorized cohort. Pre-Req-1+3
+              # partition CSVs never produced ai_l2 == 'Uncategorized'
+              # (validator wasn't running), so this is a no-op against
+              # historical data.
               raw_subcats = merged[subcol].dropna().unique().tolist()
-              subcats = [s for s in raw_subcats if s and s != 'Uncategorized']
+              subcats = [s for s in raw_subcats if s and not _is_uncat_or_null(s)]
               if len(raw_subcats) != len(subcats):
-                  print(f"[Req 1+3] L4 matrix: filtered 'Uncategorized' "
+                  print(f"[Req 1+3] L4 matrix: filtered 'Uncategorized'/NULL "
                         f"(raw={len(raw_subcats)} -> matrix={len(subcats)})")
               print(f"\nFound {len(subcats)} subcategories: {subcats}")
           else:
